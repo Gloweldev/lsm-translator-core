@@ -1,0 +1,15 @@
+# --- Núcleo Matemático ---
+numpy
+pandas
+
+# --- Visión y Procesamiento (MediaPipe) ---
+opencv-python
+mediapipe
+
+# --- Inteligencia Artificial (El Cerebro) ---
+torch
+torchvision
+# --- Documentación y Gráficas ---
+mlflow
+matplotlib
+tqdm
