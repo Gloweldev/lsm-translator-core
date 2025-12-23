@@ -1,24 +1,53 @@
-# Ignorar archivos temporales de Python
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
 
-# Ignorar Datos (Videos y JSONs pesados)
-data/
-*.mp4
-*.avi
-*.mov
-
-# Ignorar Modelos Entrenados (Pesan mucho)
-models/
-*.pth
-*.pt
-*.pkl
-
-# Ignorar Carpetas de IDEs y Entornos
-.vscode/
-.idea/
+# Virtual environments
 venv/
-env/
+ENV/
+.venv/
 
-# Ignorar Logs de MLflow (Se quedan locales)
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data (grandes archivos)
+dataset/raw/**/*.mp4
+dataset/processed/**/*.npy
+
+# Modelos y experimentos
+experiments/mlruns/
 mlruns/
+*.pth
+*.onnx
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temp
+*.tmp
+*.temp
+
+# Screenshots
+screenshot_*.png
+

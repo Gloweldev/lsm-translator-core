@@ -1,15 +1,14 @@
-# --- Núcleo Matemático ---
-numpy
-pandas
+# --- NÚCLEO ---
+numpy<2.0.0              # Vital: NumPy 2.0 rompe PyTorch y OpenMMLab
+opencv-python            # Manejo de video
+tqdm                     # Barras de progreso
 
-# --- Visión y Procesamiento (MediaPipe) ---
-opencv-python
-mediapipe
-
-# --- Inteligencia Artificial (El Cerebro) ---
-torch
-torchvision
-# --- Documentación y Gráficas ---
-mlflow
-matplotlib
-tqdm
+# --- MLOps & DATOS ---
+mlflow                   # Registro de experimentos
+scikit-learn             # Splits de datos y métricas
+pandas                   # Manipulación de datos
+matplotlib               # Gráficas
+seaborn                  # Gráficas bonitas
+# --- UTILIDADES ---
+colorama                 # Colores en terminal
+python-dotenv            # Variables de entorno

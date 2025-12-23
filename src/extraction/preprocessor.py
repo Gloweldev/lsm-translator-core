@@ -1,0 +1,428 @@
+"""
+Preprocesador de Videos LSM.
+
+Convierte videos .mp4 a tensores .npy usando RTMPose-WholeBody.
+Aplica:
+    1. Extracción de 133 keypoints con RTMPose
+    2. Filtro de confianza (scores < threshold -> (0,0))
+    3. Suavizado OneEuroFilter
+    4. Normalización relativa (centrado en caderas)
+
+Uso:
+    python -m src.extraction.preprocessor
+"""
+
+import cv2
+import numpy as np
+import sys
+import time
+from pathlib import Path
+from tqdm import tqdm
+import logging
+
+# Path setup
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from src.config.settings import (
+    RAW_DATA_DIR,
+    PROCESSED_DATA_DIR,
+    RTMPOSE_MODEL,
+    KEYPOINTS_PER_FRAME,
+    INPUT_DIM,
+    CONFIDENCE_THRESHOLD,
+    FILTER_MIN_CUTOFF,
+    FILTER_BETA,
+    LEFT_HIP_IDX,
+    RIGHT_HIP_IDX,
+    ensure_dirs,
+    load_classes
+)
+from src.utils.smoothing import OneEuroFilter
+
+# RTMPose
+import torch
+from mmpose.apis import MMPoseInferencer
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+class KeypointSmoother:
+    """
+    Aplica OneEuroFilter a todos los keypoints.
+    Gestiona 133 puntos × 2 coordenadas = 266 filtros.
+    """
+    
+    def __init__(
+        self,
+        num_keypoints: int = KEYPOINTS_PER_FRAME,
+        min_cutoff: float = FILTER_MIN_CUTOFF,
+        beta: float = FILTER_BETA
+    ):
+        self.num_keypoints = num_keypoints
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.filters = None
+        self.initialized = False
+    
+    def reset(self):
+        """Reinicia los filtros (llamar al iniciar nuevo video)."""
+        self.filters = None
+        self.initialized = False
+    
+    def _init_filters(self, t0: float, keypoints: np.ndarray):
+        """Inicializa filtros con el primer frame."""
+        self.filters = []
+        for i in range(self.num_keypoints):
+            x = keypoints[i, 0] if i < len(keypoints) else 0.0
+            y = keypoints[i, 1] if i < len(keypoints) else 0.0
+            
+            filter_x = OneEuroFilter(
+                t0=t0, x0=x,
+                min_cutoff=self.min_cutoff,
+                beta=self.beta
+            )
+            filter_y = OneEuroFilter(
+                t0=t0, x0=y,
+                min_cutoff=self.min_cutoff,
+                beta=self.beta
+            )
+            self.filters.append((filter_x, filter_y))
+        self.initialized = True
+    
+    def smooth(self, t: float, keypoints: np.ndarray) -> np.ndarray:
+        """
+        Suaviza los keypoints.
+        
+        Args:
+            t: Timestamp en segundos
+            keypoints: Array Nx2 con coordenadas
+            
+        Returns:
+            Array Nx2 suavizado
+        """
+        if keypoints is None or len(keypoints) == 0:
+            return np.zeros((self.num_keypoints, 2))
+        
+        if not self.initialized:
+            self._init_filters(t, keypoints)
+            return keypoints[:, :2].copy()
+        
+        smoothed = np.zeros((self.num_keypoints, 2))
+        for i in range(min(len(keypoints), self.num_keypoints)):
+            filter_x, filter_y = self.filters[i]
+            smoothed[i, 0] = filter_x(t, keypoints[i, 0])
+            smoothed[i, 1] = filter_y(t, keypoints[i, 1])
+        
+        return smoothed
+
+
+def apply_confidence_filter(keypoints: np.ndarray, scores: np.ndarray, threshold: float) -> np.ndarray:
+    """
+    Aplica filtro de confianza: puntos con score < threshold -> (0, 0).
+    
+    Args:
+        keypoints: Nx2 array de coordenadas
+        scores: N array de scores
+        threshold: Umbral mínimo de confianza
+        
+    Returns:
+        Nx2 array con puntos filtrados
+    """
+    filtered = keypoints.copy()
+    
+    for i, score in enumerate(scores):
+        if score < threshold:
+            filtered[i] = [0.0, 0.0]
+    
+    return filtered
+
+
+def normalize_to_center(keypoints: np.ndarray, left_hip_idx: int = LEFT_HIP_IDX, right_hip_idx: int = RIGHT_HIP_IDX) -> np.ndarray:
+    """
+    Normaliza keypoints restando el centro de las caderas.
+    Esto hace que las señas sean invariantes a la posición del usuario.
+    
+    Args:
+        keypoints: Nx2 array de coordenadas
+        left_hip_idx: Índice de cadera izquierda
+        right_hip_idx: Índice de cadera derecha
+        
+    Returns:
+        Nx2 array normalizado
+    """
+    # Calcular centro de caderas
+    left_hip = keypoints[left_hip_idx] if left_hip_idx < len(keypoints) else np.array([0, 0])
+    right_hip = keypoints[right_hip_idx] if right_hip_idx < len(keypoints) else np.array([0, 0])
+    
+    # Si ambas caderas son válidas (no cero)
+    if np.any(left_hip != 0) and np.any(right_hip != 0):
+        center = (left_hip + right_hip) / 2
+    elif np.any(left_hip != 0):
+        center = left_hip
+    elif np.any(right_hip != 0):
+        center = right_hip
+    else:
+        # Si no hay caderas, usar el centroide de puntos válidos
+        valid_mask = np.any(keypoints != 0, axis=1)
+        if np.any(valid_mask):
+            center = keypoints[valid_mask].mean(axis=0)
+        else:
+            center = np.array([0.5, 0.5])  # Default al centro
+    
+    # Restar centro
+    normalized = keypoints - center
+    
+    return normalized
+
+
+class VideoPreprocessor:
+    """
+    Procesa videos y genera tensores .npy para el Transformer.
+    """
+    
+    def __init__(self, device: str = None):
+        """
+        Inicializa el preprocesador.
+        
+        Args:
+            device: 'cuda' o 'cpu' (None = auto)
+        """
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        self.device = device
+        self.inferencer = None
+        self.smoother = KeypointSmoother()
+    
+    def _init_inferencer(self):
+        """Inicializa RTMPose (lazy loading)."""
+        if self.inferencer is None:
+            logger.info(f"🚀 Cargando RTMPose en {self.device}...")
+            self.inferencer = MMPoseInferencer(
+                pose2d=RTMPOSE_MODEL,
+                device=self.device
+            )
+            logger.info("✅ RTMPose cargado")
+    
+    def process_video(
+        self,
+        video_path: Path,
+        output_path: Path,
+        apply_smoothing: bool = True,
+        apply_normalization: bool = True
+    ) -> dict:
+        """
+        Procesa un video y guarda el tensor .npy.
+        
+        Args:
+            video_path: Ruta al video .mp4
+            output_path: Ruta donde guardar el .npy
+            apply_smoothing: Aplicar OneEuroFilter
+            apply_normalization: Aplicar normalización relativa
+            
+        Returns:
+            Dict con estadísticas del procesamiento
+        """
+        stats = {
+            'status': 'error',
+            'frames': 0,
+            'valid_frames': 0,
+            'error': None
+        }
+        
+        # Skip si ya existe
+        if output_path.exists():
+            stats['status'] = 'skipped'
+            return stats
+        
+        try:
+            self._init_inferencer()
+            
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                stats['error'] = 'Could not open video'
+                return stats
+            
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            # Reset smoother para este video
+            self.smoother.reset()
+            
+            all_keypoints = []
+            frame_idx = 0
+            
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                timestamp = frame_idx / fps
+                
+                # Convertir a RGB
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Inferencia RTMPose
+                results = list(self.inferencer(rgb, return_vis=False))
+                
+                keypoints = np.zeros((KEYPOINTS_PER_FRAME, 2))
+                scores = np.zeros(KEYPOINTS_PER_FRAME)
+                
+                if results and len(results) > 0:
+                    preds = results[0].get('predictions', [])
+                    if preds and len(preds) > 0 and len(preds[0]) > 0:
+                        pred = preds[0][0]
+                        raw_kp = np.array(pred.get('keypoints', []))
+                        raw_scores = np.array(pred.get('keypoint_scores', []))
+                        
+                        # Copiar lo que tengamos
+                        n = min(len(raw_kp), KEYPOINTS_PER_FRAME)
+                        keypoints[:n] = raw_kp[:n, :2]
+                        scores[:n] = raw_scores[:n]
+                        
+                        stats['valid_frames'] += 1
+                
+                # Paso A: Filtro de confianza
+                keypoints = apply_confidence_filter(keypoints, scores, CONFIDENCE_THRESHOLD)
+                
+                # Paso B: Suavizado
+                if apply_smoothing:
+                    keypoints = self.smoother.smooth(timestamp, keypoints)
+                
+                # Paso C: Normalización
+                if apply_normalization:
+                    keypoints = normalize_to_center(keypoints)
+                
+                # Aplanar a vector de 266
+                flat = keypoints.flatten()
+                all_keypoints.append(flat)
+                
+                frame_idx += 1
+            
+            cap.release()
+            
+            stats['frames'] = frame_idx
+            
+            if len(all_keypoints) == 0:
+                stats['error'] = 'No frames extracted'
+                return stats
+            
+            # Guardar como numpy
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            tensor = np.array(all_keypoints, dtype=np.float32)
+            np.save(str(output_path), tensor)
+            
+            stats['status'] = 'success'
+            stats['shape'] = tensor.shape
+            
+        except Exception as e:
+            stats['error'] = str(e)
+            logger.error(f"Error procesando {video_path.name}: {e}")
+        
+        return stats
+    
+    def process_all(
+        self,
+        apply_smoothing: bool = True,
+        apply_normalization: bool = True
+    ):
+        """
+        Procesa todos los videos en RAW_DATA_DIR.
+        """
+        ensure_dirs()
+        load_classes()
+        
+        # Recolectar todos los videos
+        videos = []
+        for class_dir in RAW_DATA_DIR.iterdir():
+            if not class_dir.is_dir():
+                continue
+            
+            class_name = class_dir.name
+            for video_file in class_dir.glob("*.mp4"):
+                output_path = PROCESSED_DATA_DIR / class_name / (video_file.stem + ".npy")
+                videos.append((video_file, output_path, class_name))
+        
+        if not videos:
+            logger.error(f"❌ No se encontraron videos en {RAW_DATA_DIR}")
+            return
+        
+        logger.info(f"📂 Encontrados {len(videos)} videos para procesar")
+        
+        # Estadísticas
+        stats_total = {
+            'success': 0,
+            'skipped': 0,
+            'error': 0
+        }
+        errors = []
+        
+        # Procesar con barra de progreso
+        for video_path, output_path, class_name in tqdm(videos, desc="Procesando videos"):
+            result = self.process_video(
+                video_path,
+                output_path,
+                apply_smoothing=apply_smoothing,
+                apply_normalization=apply_normalization
+            )
+            
+            if result['status'] == 'success':
+                stats_total['success'] += 1
+            elif result['status'] == 'skipped':
+                stats_total['skipped'] += 1
+            else:
+                stats_total['error'] += 1
+                errors.append((video_path.name, result.get('error', 'Unknown')))
+        
+        # Resumen
+        logger.info("=" * 50)
+        logger.info("📊 RESUMEN DEL PROCESAMIENTO")
+        logger.info("=" * 50)
+        logger.info(f"✅ Exitosos:   {stats_total['success']}")
+        logger.info(f"⏭️  Saltados:   {stats_total['skipped']}")
+        logger.info(f"❌ Errores:    {stats_total['error']}")
+        
+        if errors:
+            logger.warning("\n⚠️ Videos con errores:")
+            for name, err in errors[:10]:  # Mostrar máximo 10
+                logger.warning(f"   - {name}: {err}")
+            if len(errors) > 10:
+                logger.warning(f"   ... y {len(errors) - 10} más")
+        
+        # Verificar output
+        logger.info("\n📁 Archivos generados por clase:")
+        for class_dir in PROCESSED_DATA_DIR.iterdir():
+            if class_dir.is_dir():
+                count = len(list(class_dir.glob("*.npy")))
+                logger.info(f"   {class_dir.name}: {count}")
+
+
+def main():
+    """Punto de entrada."""
+    print("=" * 60)
+    print("🔄 LSM-Core Video Preprocessor")
+    print("=" * 60)
+    print(f"📂 Input:  {RAW_DATA_DIR}")
+    print(f"📦 Output: {PROCESSED_DATA_DIR}")
+    print(f"🎯 Model:  {RTMPOSE_MODEL}")
+    print(f"🔧 Confidence Threshold: {CONFIDENCE_THRESHOLD}")
+    print(f"🔧 Smoothing: min_cutoff={FILTER_MIN_CUTOFF}, beta={FILTER_BETA}")
+    print("=" * 60)
+    
+    preprocessor = VideoPreprocessor()
+    preprocessor.process_all(
+        apply_smoothing=True,
+        apply_normalization=True
+    )
+    
+    print("\n✅ Procesamiento completado!")
+
+
+if __name__ == "__main__":
+    main()
