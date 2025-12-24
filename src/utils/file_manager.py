@@ -4,7 +4,7 @@ Utilidades para manejo de archivos.
 
 from pathlib import Path
 from typing import List, Dict
-from src.config.settings import RAW_DATA_DIR, PROCESSED_DATA_DIR, CLASSES
+from src.config.settings import RAW_DATA_DIR, PROCESSED_DATA_DIR, CLASS_NAMES
 
 
 def list_files(directory: Path, extension: str = "*") -> List[Path]:
@@ -29,7 +29,7 @@ def count_samples(data_dir: Path = None) -> Dict[str, int]:
     
     counts = {}
     
-    for class_name in CLASSES:
+    for class_name in CLASS_NAMES:
         class_dir = data_dir / class_name
         if class_dir.exists():
             if data_dir == RAW_DATA_DIR:

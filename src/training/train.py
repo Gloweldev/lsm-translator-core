@@ -1,13 +1,9 @@
 """
 Script Maestro de Entrenamiento LSM-Core v2.
 
-Mejoras:
-    - Feature Weights: Prioriza manos sobre cara en el modelo
-    - Oversampling: Balancea clases minoritarias
-    - Label Smoothing: Previene sobreconfianza
-    - Regularización avanzada: Dropout, Weight Decay, Gradient Clipping
-    - Early Stopping + LR Scheduling
-    
+Toda la configuración se importa desde src/config/settings.py
+No modificar hyperparámetros aquí, solo en settings.py
+
 Uso:
     python -m src.training.train
 """
@@ -39,53 +35,36 @@ import mlflow.pytorch
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.config.settings import (
+    # Rutas
     PROCESSED_DATA_DIR,
     MLRUNS_DIR,
+    # Modelo
     INPUT_DIM,
-    MAX_SEQ_LEN,
     D_MODEL,
     N_HEADS,
     N_LAYERS,
+    DROPOUT,
+    MAX_SEQ_LEN,
+    # Training
     BATCH_SIZE,
     LEARNING_RATE,
+    WEIGHT_DECAY,
+    GRADIENT_CLIP,
+    LABEL_SMOOTHING,
     EPOCHS,
     PATIENCE,
+    MIN_DELTA,
+    TEST_SIZE,
+    # Clases
+    CLASS_NAMES,
+    NUM_CLASSES,
+    # MLflow
+    MLFLOW_EXPERIMENT_NAME,
+    get_mlflow_tracking_uri,
+    # Utils
     ensure_dirs
 )
 from src.models.transformer import LSMTransformer
-
-# =============================================
-# CONFIGURACIÓN MEJORADA
-# =============================================
-CLASS_NAMES = ['a', 'b', 'c', 'hola', 'nada']
-NUM_CLASSES = len(CLASS_NAMES)
-
-# Hiperparámetros optimizados
-TRAIN_CONFIG = {
-    # Datos
-    'epochs': 150,              # Más épocas con early stopping
-    'batch_size': 32,           # Batch más grande
-    'test_size': 0.2,
-    'max_seq_len': MAX_SEQ_LEN,
-    
-    # Modelo
-    'input_dim': INPUT_DIM,
-    'num_classes': NUM_CLASSES,
-    'd_model': 128,
-    'n_heads': 4,
-    'n_layers': 3,              # Una capa más
-    'dropout': 0.4,             # Mayor dropout
-    
-    # Optimización
-    'learning_rate': 3e-4,      # LR más alto
-    'weight_decay': 1e-4,       # Mayor regularización L2
-    'label_smoothing': 0.1,     # Previene sobreconfianza
-    'gradient_clip': 1.0,
-    
-    # Early stopping
-    'patience': 20,             # Más paciencia
-    'min_delta': 0.001,
-}
 
 
 # =============================================
@@ -125,11 +104,10 @@ class LSMDataset(Dataset):
         # 1. Ruido gaussiano
         if np.random.random() < 0.5:
             noise = np.random.normal(0, 0.02, seq.shape)
-            # Solo añadir ruido a valores no-cero
             mask = seq != 0
             seq = seq + noise * mask
         
-        # 2. Escalado temporal (acelerar/ralentizar)
+        # 2. Escalado temporal
         if np.random.random() < 0.3:
             scale = np.random.uniform(0.8, 1.2)
             indices = np.linspace(0, len(seq)-1, int(len(seq) * scale))
@@ -139,7 +117,7 @@ class LSMDataset(Dataset):
         # 3. Dropout de frames
         if np.random.random() < 0.2:
             drop_mask = np.random.random(len(seq)) > 0.1
-            if drop_mask.sum() > 10:  # Mantener al menos 10 frames
+            if drop_mask.sum() > 10:
                 seq = seq[drop_mask]
         
         return seq
@@ -167,32 +145,24 @@ def load_dataset(data_dir: Path):
                 if data.shape[1] == INPUT_DIM:
                     sequences.append(data)
                     labels.append(class_idx)
-            except Exception as e:
-                pass  # Ignorar archivos corruptos
+            except Exception:
+                pass
     
     print(f"✅ Total: {len(sequences)} muestras")
     return sequences, labels
 
 
 def create_balanced_sampler(labels):
-    """
-    Crea un sampler que balancea las clases durante el entrenamiento.
-    Clases minoritarias se muestrean más frecuentemente.
-    """
+    """Crea sampler que balancea clases durante entrenamiento."""
     class_counts = Counter(labels)
     weights = [1.0 / class_counts[label] for label in labels]
-    sampler = WeightedRandomSampler(
-        weights=weights,
-        num_samples=len(labels),
-        replacement=True
-    )
-    return sampler
+    return WeightedRandomSampler(weights, len(labels), replacement=True)
 
 
 # =============================================
 # ENTRENAMIENTO
 # =============================================
-def train_epoch(model, loader, criterion, optimizer, device, config):
+def train_epoch(model, loader, criterion, optimizer, device):
     """Entrena una época."""
     model.train()
     total_loss = 0
@@ -208,9 +178,7 @@ def train_epoch(model, loader, criterion, optimizer, device, config):
         loss = criterion(outputs, labels)
         loss.backward()
         
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config['gradient_clip'])
-        
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP)
         optimizer.step()
         
         total_loss += loss.item()
@@ -255,19 +223,16 @@ def plot_confusion_matrix(y_true, y_pred, save_path):
                 xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
     plt.xlabel('Predicción')
     plt.ylabel('Real')
-    plt.title('Matriz de Confusión - LSM Transformer v2')
+    plt.title('Matriz de Confusión - LSM Transformer')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close()
-    
-    return str(save_path)
 
 
 def plot_training_curves(history, save_path):
     """Genera curvas de entrenamiento."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     
-    # Loss
     axes[0].plot(history['train_loss'], label='Train', color='blue')
     axes[0].plot(history['val_loss'], label='Validation', color='orange')
     axes[0].set_xlabel('Epoch')
@@ -276,7 +241,6 @@ def plot_training_curves(history, save_path):
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
     
-    # Accuracy
     axes[1].plot(history['train_acc'], label='Train', color='blue')
     axes[1].plot(history['val_acc'], label='Validation', color='orange')
     axes[1].set_xlabel('Epoch')
@@ -292,11 +256,33 @@ def plot_training_curves(history, save_path):
 
 def main():
     """Punto de entrada principal."""
+    # Construir config dict para logging
+    config = {
+        'input_dim': INPUT_DIM,
+        'num_classes': NUM_CLASSES,
+        'd_model': D_MODEL,
+        'n_heads': N_HEADS,
+        'n_layers': N_LAYERS,
+        'dropout': DROPOUT,
+        'max_seq_len': MAX_SEQ_LEN,
+        'batch_size': BATCH_SIZE,
+        'learning_rate': LEARNING_RATE,
+        'weight_decay': WEIGHT_DECAY,
+        'gradient_clip': GRADIENT_CLIP,
+        'label_smoothing': LABEL_SMOOTHING,
+        'epochs': EPOCHS,
+        'patience': PATIENCE,
+        'min_delta': MIN_DELTA,
+        'test_size': TEST_SIZE,
+    }
+    
     print("=" * 70)
-    print("🚀 LSM-Core Training Pipeline v2")
-    print("   - Feature Weights (Manos > Cara)")
-    print("   - Oversampling + Label Smoothing")
-    print("   - Regularización avanzada")
+    print("🚀 LSM-Core Training Pipeline")
+    print("=" * 70)
+    print(f"📊 Config desde settings.py:")
+    print(f"   Modelo: d_model={D_MODEL}, heads={N_HEADS}, layers={N_LAYERS}")
+    print(f"   Training: epochs={EPOCHS}, batch={BATCH_SIZE}, lr={LEARNING_RATE}")
+    print(f"   Clases: {CLASS_NAMES}")
     print("=" * 70)
     
     ensure_dirs()
@@ -316,65 +302,51 @@ def main():
     label_counts = Counter(labels)
     print("\n📊 Distribución de clases:")
     for i, name in enumerate(CLASS_NAMES):
-        count = label_counts.get(i, 0)
-        print(f"   {name}: {count}")
+        print(f"   {name}: {label_counts.get(i, 0)}")
     
     # Split estratificado
     X_train, X_val, y_train, y_val = train_test_split(
         sequences, labels,
-        test_size=TRAIN_CONFIG['test_size'],
+        test_size=TEST_SIZE,
         stratify=labels,
         random_state=42
     )
     
-    print(f"\n📊 Split:")
-    print(f"  Train: {len(X_train)}")
-    print(f"  Val:   {len(X_val)}")
+    print(f"\n📊 Split: Train={len(X_train)}, Val={len(X_val)}")
     
     # Datasets
-    train_dataset = LSMDataset(X_train, y_train, TRAIN_CONFIG['max_seq_len'], augment=True)
-    val_dataset = LSMDataset(X_val, y_val, TRAIN_CONFIG['max_seq_len'], augment=False)
-    
-    # Sampler para balancear clases
-    train_sampler = create_balanced_sampler(y_train)
+    train_dataset = LSMDataset(X_train, y_train, MAX_SEQ_LEN, augment=True)
+    val_dataset = LSMDataset(X_val, y_val, MAX_SEQ_LEN, augment=False)
     
     # Dataloaders
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=TRAIN_CONFIG['batch_size'], 
-        sampler=train_sampler,  # Usa sampler en vez de shuffle
+        batch_size=BATCH_SIZE, 
+        sampler=create_balanced_sampler(y_train),
         num_workers=0
     )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=TRAIN_CONFIG['batch_size'], 
-        shuffle=False
-    )
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
     
     # Modelo
     model = LSMTransformer(
-        input_dim=TRAIN_CONFIG['input_dim'],
-        num_classes=TRAIN_CONFIG['num_classes'],
-        d_model=TRAIN_CONFIG['d_model'],
-        nhead=TRAIN_CONFIG['n_heads'],
-        num_layers=TRAIN_CONFIG['n_layers'],
-        dropout=TRAIN_CONFIG['dropout'],
-        max_seq_len=TRAIN_CONFIG['max_seq_len']
+        input_dim=INPUT_DIM,
+        num_classes=NUM_CLASSES,
+        d_model=D_MODEL,
+        nhead=N_HEADS,
+        num_layers=N_LAYERS,
+        dropout=DROPOUT,
+        max_seq_len=MAX_SEQ_LEN
     ).to(device)
     
     print(f"\n🧠 Modelo: {model.count_parameters():,} parámetros")
     
-    # Loss con Label Smoothing (previene sobreconfianza)
-    criterion = nn.CrossEntropyLoss(label_smoothing=TRAIN_CONFIG['label_smoothing'])
+    # Loss con Label Smoothing
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
     
-    # Optimizer con weight decay
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=TRAIN_CONFIG['learning_rate'],
-        weight_decay=TRAIN_CONFIG['weight_decay']
-    )
+    # Optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     
-    # Scheduler: Reduce LR on plateau
+    # Scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', patience=10, factor=0.5, verbose=True
     )
@@ -382,81 +354,64 @@ def main():
     # =============================================
     # MLflow
     # =============================================
-    mlflow_db = MLRUNS_DIR / "mlflow.db"
-    mlflow.set_tracking_uri(f"sqlite:///{mlflow_db}")
-    mlflow.set_experiment("LSM_Core_Training_v2")
+    mlflow.set_tracking_uri(get_mlflow_tracking_uri())
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
     
-    print("\n" + "=" * 70)
-    print("📈 Iniciando entrenamiento...")
+    print(f"\n📈 MLflow: {get_mlflow_tracking_uri()}")
     print("=" * 70)
     
-    with mlflow.start_run(run_name=f"v2_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
-        # Log parámetros
-        mlflow.log_params(TRAIN_CONFIG)
+    with mlflow.start_run(run_name=f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
+        mlflow.log_params(config)
         mlflow.log_param("class_names", CLASS_NAMES)
-        mlflow.log_param("class_distribution", dict(label_counts))
         
         best_val_acc = 0
         patience_counter = 0
         best_model_path = MLRUNS_DIR / "best_model.pth"
         
-        # Historia para gráficas
-        history = {
-            'train_loss': [], 'train_acc': [],
-            'val_loss': [], 'val_acc': []
-        }
+        history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
         
-        for epoch in range(TRAIN_CONFIG['epochs']):
-            # Train
-            train_loss, train_acc = train_epoch(
-                model, train_loader, criterion, optimizer, device, TRAIN_CONFIG
-            )
+        for epoch in range(EPOCHS):
+            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+            val_loss, val_acc, _, _ = evaluate(model, val_loader, criterion, device)
             
-            # Validate
-            val_loss, val_acc, val_preds, val_labels = evaluate(
-                model, val_loader, criterion, device
-            )
-            
-            # Scheduler
             scheduler.step(val_acc)
             
-            # Guardar historia
             history['train_loss'].append(train_loss)
             history['train_acc'].append(train_acc)
             history['val_loss'].append(val_loss)
             history['val_acc'].append(val_acc)
             
-            # Log métricas
             mlflow.log_metrics({
-                "train_loss": train_loss,
-                "train_acc": train_acc,
-                "val_loss": val_loss,
-                "val_acc": val_acc,
+                "train_loss": train_loss, "train_acc": train_acc,
+                "val_loss": val_loss, "val_acc": val_acc,
                 "lr": optimizer.param_groups[0]['lr']
             }, step=epoch)
             
-            # Print
-            print(f"Epoch {epoch+1:3d}/{TRAIN_CONFIG['epochs']} | "
+            print(f"Epoch {epoch+1:3d}/{EPOCHS} | "
                   f"Train: {train_loss:.4f} / {train_acc:.4f} | "
                   f"Val: {val_loss:.4f} / {val_acc:.4f}")
             
             # Checkpointing
-            if val_acc > best_val_acc + TRAIN_CONFIG['min_delta']:
+            if val_acc > best_val_acc + MIN_DELTA:
                 best_val_acc = val_acc
                 patience_counter = 0
+                
+                # Obtener run_id actual de MLflow
+                run_id = mlflow.active_run().info.run_id
                 
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_acc': val_acc,
-                    'config': TRAIN_CONFIG
+                    'config': config,
+                    'run_id': run_id  # Para identificar versión del modelo
                 }, best_model_path)
                 
                 print(f"  ✅ Best model saved (val_acc: {val_acc:.4f})")
             else:
                 patience_counter += 1
-                if patience_counter >= TRAIN_CONFIG['patience']:
+                if patience_counter >= PATIENCE:
                     print(f"\n⏹️ Early stopping en epoch {epoch+1}")
                     break
         
@@ -467,30 +422,23 @@ def main():
         print("📊 Evaluación Final")
         print("=" * 70)
         
-        # Cargar mejor modelo
         checkpoint = torch.load(best_model_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         
-        # Evaluar
-        _, final_acc, final_preds, final_labels = evaluate(
-            model, val_loader, criterion, device
-        )
+        _, final_acc, final_preds, final_labels = evaluate(model, val_loader, criterion, device)
         
         print(f"\n🎯 Mejor Val Accuracy: {best_val_acc:.4f}")
         print(f"\nClassification Report:")
         print(classification_report(final_labels, final_preds, target_names=CLASS_NAMES))
         
-        # Matriz de confusión
+        # Gráficas
         cm_path = MLRUNS_DIR / "confusion_matrix.png"
         plot_confusion_matrix(final_labels, final_preds, cm_path)
-        print(f"\n📊 Matriz de confusión: {cm_path}")
         
-        # Curvas de entrenamiento
         curves_path = MLRUNS_DIR / "training_curves.png"
         plot_training_curves(history, curves_path)
-        print(f"📈 Curvas de entrenamiento: {curves_path}")
         
-        # Feature weights finales
+        # Feature weights
         feature_weights = model.get_feature_weights()
         print(f"\n🔧 Feature Weights (promedio por región):")
         print(f"   Cuerpo: {feature_weights[0:34].mean().item():.3f}")
@@ -502,18 +450,15 @@ def main():
         mlflow.log_artifact(str(cm_path))
         mlflow.log_artifact(str(curves_path))
         mlflow.log_artifact(str(best_model_path))
-        mlflow.log_artifact(__file__)
-        
-        # Log modelo
         mlflow.pytorch.log_model(model, "model")
         
-        # Métricas finales
         mlflow.log_metric("best_val_acc", best_val_acc)
         mlflow.log_metric("epochs_trained", len(history['train_loss']))
         
         print("\n" + "=" * 70)
         print("✅ Entrenamiento completado")
-        print(f"📁 Artefactos en: {MLRUNS_DIR}")
+        print(f"📁 Modelo: {best_model_path}")
+        print(f"📊 MLflow UI: mlflow ui --backend-store-uri {get_mlflow_tracking_uri()}")
         print("=" * 70)
 
 

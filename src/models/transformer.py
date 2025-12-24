@@ -2,7 +2,7 @@
 Arquitectura Transformer para clasificación de secuencias de landmarks LSM.
 
 Incluye:
-    - Feature Weights: Prioriza manos sobre cara
+    - Feature Weights: Prioriza manos sobre cara (configurable en settings.py)
     - Regularización avanzada: Label Smoothing, LayerNorm, Dropout
     - Arquitectura optimizada para secuencias temporales
 """
@@ -12,7 +12,8 @@ import torch.nn as nn
 import math
 
 from src.config.settings import (
-    INPUT_DIM, D_MODEL, N_HEADS, N_LAYERS, DROPOUT, NUM_CLASSES, MAX_SEQ_LEN
+    INPUT_DIM, D_MODEL, N_HEADS, N_LAYERS, DROPOUT, NUM_CLASSES, MAX_SEQ_LEN,
+    FEATURE_WEIGHTS
 )
 
 # =============================================================================
@@ -29,6 +30,7 @@ from src.config.settings import (
 def create_feature_weights(input_dim: int = INPUT_DIM) -> torch.Tensor:
     """
     Crea pesos por feature para enfatizar manos y reducir importancia de cara.
+    Los pesos se leen de settings.FEATURE_WEIGHTS
     
     Returns:
         Tensor de shape [input_dim] con pesos por feature
@@ -42,12 +44,12 @@ def create_feature_weights(input_dim: int = INPUT_DIM) -> torch.Tensor:
     left_hand_start, left_hand_end = 91 * 2, 112 * 2   # 182-223
     right_hand_start, right_hand_end = 112 * 2, 133 * 2  # 224-265
     
-    # Asignar pesos
-    weights[body_start:body_end] = 1.0         # Cuerpo: peso normal
-    weights[feet_start:feet_end] = 0.3         # Pies: poco relevante
-    weights[face_start:face_end] = 0.1         # Cara: mínimo
-    weights[left_hand_start:left_hand_end] = 2.5  # Mano izq: muy importante
-    weights[right_hand_start:right_hand_end] = 2.5  # Mano der: muy importante
+    # Asignar pesos desde settings
+    weights[body_start:body_end] = FEATURE_WEIGHTS['body']
+    weights[feet_start:feet_end] = FEATURE_WEIGHTS['feet']
+    weights[face_start:face_end] = FEATURE_WEIGHTS['face']
+    weights[left_hand_start:left_hand_end] = FEATURE_WEIGHTS['left_hand']
+    weights[right_hand_start:right_hand_end] = FEATURE_WEIGHTS['right_hand']
     
     return weights
 

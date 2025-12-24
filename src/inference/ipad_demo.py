@@ -30,11 +30,14 @@ from src.config.settings import (
     INPUT_DIM,
     MAX_SEQ_LEN,
     CONFIDENCE_THRESHOLD,
+    FILTER_MIN_CUTOFF,
+    FILTER_BETA,
     D_MODEL,
     N_HEADS,
     N_LAYERS,
     RTMPOSE_MODEL
 )
+from src.utils.smoothing import OneEuroFilter
 from src.models.transformer import LSMTransformer
 
 # RTMPose
@@ -44,7 +47,7 @@ from mmpose.apis import MMPoseInferencer
 # CONFIGURACIÓN
 # =============================================
 # Cámara IP (DroidCam/EpocCam)
-CAMERA_IP = "192.168.100.134"
+CAMERA_IP = "192.168.100.104"
 CAMERA_PORT = 4747
 CAMERA_URL = f"http://{CAMERA_IP}:{CAMERA_PORT}/video"
 
@@ -92,6 +95,10 @@ class LSMInference:
         self.stable_count = 0
         self.stable_prediction = None
         
+        # Smoothers (OneEuroFilter por keypoint - igual que preprocessing)
+        self.smoothers = None
+        self.frame_count = 0
+        
         # Cargar modelos
         self._load_rtmpose()
         self._load_transformer(model_path)
@@ -113,11 +120,19 @@ class LSMInference:
         if model_path is None:
             raise FileNotFoundError("No se encontró modelo entrenado")
         
-        print(f"🧠 Cargando Transformer: {model_path}")
-        
         # Cargar checkpoint para obtener config
         checkpoint = torch.load(model_path, map_location=self.device)
         config = checkpoint.get('config', {})
+        
+        # Mostrar info del modelo
+        epoch = checkpoint.get('epoch', '?')
+        val_acc = checkpoint.get('val_acc', 0)
+        run_id = checkpoint.get('run_id', 'N/A')
+        
+        print(f"🧠 Modelo: best_model.pth")
+        print(f"   Epoch: {epoch}, Val Acc: {val_acc:.4f}")
+        if run_id != 'N/A':
+            print(f"   Run ID: {run_id}")
         
         # Crear modelo con config del entrenamiento
         self.model = LSMTransformer(
@@ -133,8 +148,7 @@ class LSMInference:
         # Cargar pesos
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.eval()
-        
-        print(f"✅ Transformer cargado (val_acc: {checkpoint.get('val_acc', 'N/A'):.4f})")
+        print(f"✅ Transformer cargado")
     
     def _find_best_model(self) -> str:
         """Busca el mejor modelo en mlruns."""
@@ -202,8 +216,24 @@ class LSMInference:
                         raw_keypoints[i*2] = kp[i, 0]
                         raw_keypoints[i*2 + 1] = kp[i, 1]
         
+        # Aplicar smoothing (OneEuroFilter - igual que preprocessing)
+        self.frame_count += 1
+        t = self.frame_count / 30.0  # Timestamp en segundos (asume 30 fps)
+        
+        if self.smoothers is None:
+            # Inicializar filtros
+            self.smoothers = []
+            for i in range(INPUT_DIM):
+                self.smoothers.append(OneEuroFilter(
+                    t0=t, x0=raw_keypoints[i],
+                    min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA
+                ))
+            smoothed_keypoints = raw_keypoints.copy()
+        else:
+            smoothed_keypoints = np.array([self.smoothers[i](t, raw_keypoints[i]) for i in range(INPUT_DIM)])
+        
         # Normalizar para predicción
-        normalized_keypoints = self._normalize_to_center(raw_keypoints.copy())
+        normalized_keypoints = self._normalize_to_center(smoothed_keypoints.copy())
         
         return raw_keypoints, normalized_keypoints
     

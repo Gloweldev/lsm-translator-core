@@ -1,79 +1,138 @@
-# Guía de Pipeline de Datos
+# Guía Completa del Pipeline LSM-Core
 
-Esta guía explica cómo descargar y procesar videos para entrenar el modelo LSM.
+Esta guía documenta el flujo completo desde la descarga de datos hasta el entrenamiento y visualización.
 
 ---
 
-## 📥 Descarga de Videos
+## 🚀 Flujo Rápido
 
-### Descargar solo videos nuevos (Incremental)
+```bash
+# 1. Descargar videos nuevos
+python -m src.utils.download_videos
+
+# 2. Preprocesar videos
+python -m src.extraction.preprocessor
+
+# 3. Inspeccionar datos (opcional)
+python -m src.data.inspect_processed
+
+# 4. Entrenar modelo
+python -m src.training.train
+
+# 5. Ver resultados en MLflow
+mlflow ui --backend-store-uri "sqlite:///experiments/mlruns/mlflow.db"
+```
+
+---
+
+## 📥 1. Descarga de Videos
+
+### Incremental (solo nuevos)
 ```bash
 python -m src.utils.download_videos
 ```
-- Usa el archivo `.last_sync` para descargar solo videos creados después del último sync
-- Omite videos que ya existen localmente
 
-### Descargar todos los videos (Completo)
+### Completo (todos)
 ```bash
 python -m src.utils.download_videos --full
 ```
-- Ignora el `.last_sync`
-- Descarga todos los videos del API
-- Útil para reset completo del dataset
+
+**Ubicación:** `dataset/raw/{clase}/*.mp4`
 
 ---
 
-## 🔄 Preprocesamiento
+## 🔄 2. Preprocesamiento
 
-### Procesar solo videos nuevos (Incremental)
+### Incremental (solo sin procesar)
 ```bash
 python -m src.extraction.preprocessor
 ```
-- Solo procesa videos que no tienen un `.npy` correspondiente
-- Rápido para actualizaciones incrementales
 
-### Reprocesar todos los videos (Completo)
+### Completo (reprocesar todo)
 ```bash
 python -m src.extraction.preprocessor --full
 ```
-- Elimina y regenera todos los `.npy`
-- Útil después de cambiar parámetros de preprocesamiento
+
+**Pipeline:**
+1. RTMPose → 133 keypoints
+2. Filtro confianza (< 0.5 → 0,0)
+3. OneEuroFilter suavizado
+4. Normalización centrada en caderas
+
+**Salida:** `dataset/processed/{clase}/*.npy`
 
 ---
 
-## 🚀 Flujo Completo de Actualización
+## 🔍 3. Inspección de Datos
 
-### Caso 1: Nuevos videos agregados al servidor
 ```bash
-# 1. Descargar solo los nuevos
-python -m src.utils.download_videos
+python -m src.data.inspect_processed
+```
 
-# 2. Procesar solo los nuevos
-python -m src.extraction.preprocessor
+**Genera:**
+- Distribución de clases
+- Class weights para training
+- Histograma de longitud de videos
+- Alertas de archivos corruptos
 
-# 3. (Opcional) Reentrenar el modelo
+---
+
+## 🧠 4. Entrenamiento
+
+```bash
 python -m src.training.train
 ```
 
-### Caso 2: Reset completo del dataset
-```bash
-# 1. Descargar todo
-python -m src.utils.download_videos --full
+**Configuración en `src/config/settings.py`:**
+```python
+# Modelo
+D_MODEL = 128
+N_HEADS = 4
+N_LAYERS = 3
+DROPOUT = 0.4
 
-# 2. Reprocesar todo
-python -m src.extraction.preprocessor --full
+# Training
+EPOCHS = 150
+LEARNING_RATE = 3e-4
+BATCH_SIZE = 32
+LABEL_SMOOTHING = 0.1
 
-# 3. Reentrenar
-python -m src.training.train
+# Pesos por clase (balance)
+CLASS_WEIGHTS = [1.2515, 1.2294, 1.3933, 1.1117, 0.5649]
+
+# Pesos por región del cuerpo
+FEATURE_WEIGHTS = {
+    'body': 1.0,
+    'feet': 0.3,
+    'face': 0.1,
+    'left_hand': 2.5,
+    'right_hand': 2.5
+}
 ```
 
-### Caso 3: Cambio en parámetros de preprocesamiento
-```bash
-# Solo reprocesar (no descargar)
-python -m src.extraction.preprocessor --full
+---
 
-# Reentrenar
-python -m src.training.train
+## 📊 5. MLflow UI
+
+```bash
+cd "C:\Users\juana\Documents\Trabajo 2025\lsm-translator-core"
+mlflow ui --backend-store-uri "sqlite:///experiments/mlruns/mlflow.db"
+```
+
+Luego abrir: **http://localhost:5000**
+
+---
+
+## 🎥 6. Inferencia
+
+### Validar con videos del dataset
+```bash
+python -m src.inference.video_demo
+```
+
+### Demo en tiempo real (iPad/DroidCam)
+```bash
+python -m src.inference.ipad_demo
 ```
 
 ---
@@ -81,43 +140,38 @@ python -m src.training.train
 ## 📁 Estructura de Archivos
 
 ```
-dataset/
-├── .last_sync              # Timestamp del último sync
-├── raw/                    # Videos originales (.mp4)
-│   ├── a/
-│   ├── b/
-│   ├── hola/
-│   └── nada/
-└── processed/              # Tensores procesados (.npy)
-    ├── a/
-    ├── b/
-    ├── hola/
-    └── nada/
+lsm-translator-core/
+├── dataset/
+│   ├── .last_sync              # Timestamp último sync
+│   ├── raw/                    # Videos .mp4
+│   └── processed/              # Tensores .npy
+├── experiments/
+│   └── mlruns/
+│       ├── mlflow.db           # Base de datos MLflow
+│       ├── best_model.pth      # Mejor modelo
+│       ├── confusion_matrix.png
+│       └── training_curves.png
+├── src/
+│   ├── config/settings.py      # CONFIGURACIÓN CENTRAL
+│   ├── extraction/
+│   ├── training/
+│   ├── inference/
+│   └── models/
+└── docs/
 ```
 
 ---
 
-## ⚙️ Parámetros del Preprocesador
+## ⚙️ Parámetros Clave
 
-| Parámetro | Valor | Descripción |
-|-----------|-------|-------------|
-| `CONFIDENCE_THRESHOLD` | 0.50 | Keypoints con score < 0.5 → (0,0) |
-| `FILTER_MIN_CUTOFF` | 0.1 | OneEuroFilter suavizado |
-| `FILTER_BETA` | 0.009 | OneEuroFilter velocidad |
-| RTMPose Model | wholebody-384x288 | 133 keypoints |
-| Output Dim | 266 | 133 × 2 (x, y) |
-
----
-
-## 🔍 Verificación de Datos
-
-### Inspeccionar tensores procesados
-```bash
-python -m src.data.inspect_processed
-```
-
-Genera:
-- Distribución de clases
-- Class weights para training
-- Histograma de longitud de videos
-- Alertas de archivos corruptos
+| Parámetro | Archivo | Valor |
+|-----------|---------|-------|
+| `CONFIDENCE_THRESHOLD` | settings.py | 0.50 |
+| `D_MODEL` | settings.py | 128 |
+| `N_LAYERS` | settings.py | 3 |
+| `DROPOUT` | settings.py | 0.4 |
+| `LEARNING_RATE` | settings.py | 3e-4 |
+| `EPOCHS` | settings.py | 150 |
+| `CLASS_WEIGHTS` | settings.py | [1.25, 1.23, 1.39, 1.11, 0.56] |
+| `FEATURE_WEIGHTS.face` | settings.py | 0.1 |
+| `FEATURE_WEIGHTS.hands` | settings.py | 2.5 |

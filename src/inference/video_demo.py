@@ -32,11 +32,14 @@ from src.config.settings import (
     INPUT_DIM,
     MAX_SEQ_LEN,
     CONFIDENCE_THRESHOLD,
+    FILTER_MIN_CUTOFF,
+    FILTER_BETA,
     D_MODEL,
     N_HEADS,
     N_LAYERS,
     RTMPOSE_MODEL
 )
+from src.utils.smoothing import OneEuroFilter
 from src.models.transformer import LSMTransformer
 from mmpose.apis import MMPoseInferencer
 
@@ -71,6 +74,10 @@ class VideoValidator:
         self.LEFT_HIP_IDX = 11
         self.RIGHT_HIP_IDX = 12
         
+        # Smoothers (OneEuroFilter por keypoint - igual que preprocessing)
+        self.smoothers = None
+        self.frame_count = 0
+        
         # Cargar modelos
         self._load_rtmpose()
         self._load_transformer()
@@ -94,11 +101,19 @@ class VideoValidator:
         if not model_path.exists():
             raise FileNotFoundError("No se encontró best_model.pth")
         
-        print(f"🧠 Cargando Transformer: {model_path}")
-        
         # Cargar checkpoint para obtener config
         checkpoint = torch.load(model_path, map_location=self.device)
         config = checkpoint.get('config', {})
+        
+        # Mostrar info del modelo
+        epoch = checkpoint.get('epoch', '?')
+        val_acc = checkpoint.get('val_acc', 0)
+        run_id = checkpoint.get('run_id', 'N/A')
+        
+        print(f"🧠 Modelo: {model_path.name}")
+        print(f"   Epoch: {epoch}, Val Acc: {val_acc:.4f}")
+        if run_id != 'N/A':
+            print(f"   Run ID: {run_id}")
         
         self.model = LSMTransformer(
             input_dim=config.get('input_dim', INPUT_DIM),
@@ -112,10 +127,13 @@ class VideoValidator:
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.eval()
-        print(f"✅ Transformer cargado (val_acc: {checkpoint.get('val_acc', 'N/A'):.4f})")
+        print(f"✅ Transformer cargado")
     
     def reset(self):
+        """Reset buffer y smoothers para nuevo video."""
         self.buffer.clear()
+        self.smoothers = None
+        self.frame_count = 0
     
     def _normalize_to_center(self, keypoints_flat: np.ndarray) -> np.ndarray:
         """
@@ -170,8 +188,23 @@ class VideoValidator:
                         raw_keypoints[i*2] = kp[i, 0]
                         raw_keypoints[i*2 + 1] = kp[i, 1]
         
+        # Aplicar smoothing (OneEuroFilter - igual que preprocessing)
+        self.frame_count += 1
+        t = self.frame_count / 30.0  # Timestamp en segundos
+        
+        if self.smoothers is None:
+            self.smoothers = []
+            for i in range(INPUT_DIM):
+                self.smoothers.append(OneEuroFilter(
+                    t0=t, x0=raw_keypoints[i],
+                    min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA
+                ))
+            smoothed_keypoints = raw_keypoints.copy()
+        else:
+            smoothed_keypoints = np.array([self.smoothers[i](t, raw_keypoints[i]) for i in range(INPUT_DIM)])
+        
         # Normalizar para predicción
-        normalized_keypoints = self._normalize_to_center(raw_keypoints.copy())
+        normalized_keypoints = self._normalize_to_center(smoothed_keypoints.copy())
         
         return raw_keypoints, normalized_keypoints
     

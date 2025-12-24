@@ -8,8 +8,9 @@ from collections import deque
 from pathlib import Path
 
 from src.config.settings import (
-    MLRUNS_DIR, CLASSES, MAX_SEQ_LEN, MIN_SEQ_LEN,
-    CONFIDENCE_THRESHOLD, STABILITY_FRAMES
+    MLRUNS_DIR, CLASS_NAMES, MAX_SEQ_LEN, MIN_SEQ_LEN,
+    INPUT_DIM, D_MODEL, N_HEADS, N_LAYERS,
+    INFERENCE_CONFIDENCE_THRESHOLD, STABILITY_FRAMES
 )
 from src.models.transformer import LSMTransformer
 
@@ -24,7 +25,7 @@ class LSMPredictor:
         self,
         model_path: Path = None,
         device: str = None,
-        confidence_threshold: float = CONFIDENCE_THRESHOLD,
+        confidence_threshold: float = INFERENCE_CONFIDENCE_THRESHOLD,
         stability_frames: int = STABILITY_FRAMES
     ):
         # Device
@@ -37,8 +38,21 @@ class LSMPredictor:
         if model_path is None:
             model_path = MLRUNS_DIR / "best_model.pth"
         
-        self.model = LSMTransformer().to(self.device)
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        # Cargar checkpoint para obtener config
+        checkpoint = torch.load(model_path, map_location=self.device)
+        config = checkpoint.get('config', {})
+        
+        self.model = LSMTransformer(
+            input_dim=config.get('input_dim', INPUT_DIM),
+            num_classes=config.get('num_classes', len(CLASS_NAMES)),
+            d_model=config.get('d_model', D_MODEL),
+            nhead=config.get('n_heads', N_HEADS),
+            num_layers=config.get('n_layers', N_LAYERS),
+            dropout=0.0,
+            max_seq_len=config.get('max_seq_len', MAX_SEQ_LEN)
+        ).to(self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.eval()
         
         # Config
@@ -61,7 +75,7 @@ class LSMPredictor:
         Agrega un frame y retorna la predicción actual.
         
         Args:
-            keypoints: Vector de 258 dimensiones con los landmarks
+            keypoints: Vector de INPUT_DIM dimensiones con los landmarks
             
         Returns:
             Dict con 'prediction', 'confidence', 'is_stable', 'raw_prediction'
@@ -82,7 +96,7 @@ class LSMPredictor:
         # Preparar tensor
         data_np = np.array(self.sequence)
         if len(data_np) < MAX_SEQ_LEN:
-            pad = np.zeros((MAX_SEQ_LEN - len(data_np), 258))
+            pad = np.zeros((MAX_SEQ_LEN - len(data_np), INPUT_DIM))
             data_np = np.vstack([data_np, pad])
         
         data_tensor = torch.FloatTensor(data_np).unsqueeze(0).to(self.device)
@@ -96,7 +110,7 @@ class LSMPredictor:
             confidence = confidence.item()
             prediction_idx = prediction_idx.item()
         
-        raw_prediction = CLASSES[prediction_idx]
+        raw_prediction = CLASS_NAMES[prediction_idx]
         result['raw_prediction'] = raw_prediction
         result['confidence'] = confidence
         
@@ -110,10 +124,11 @@ class LSMPredictor:
                 # Si todos son iguales -> predicción estable
                 if len(set(self.predictions)) == 1:
                     result['is_stable'] = True
-                    if raw_prediction != "Nothing":
+                    if raw_prediction != "nada":
                         self.last_stable_prediction = raw_prediction
                     result['prediction'] = self.last_stable_prediction
         else:
             self.predictions.append("Unsure")
         
         return result
+
