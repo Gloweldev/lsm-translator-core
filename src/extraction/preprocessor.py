@@ -330,16 +330,24 @@ class VideoPreprocessor:
     def process_all(
         self,
         apply_smoothing: bool = True,
-        apply_normalization: bool = True
+        apply_normalization: bool = True,
+        full_reprocess: bool = False
     ):
         """
         Procesa todos los videos en RAW_DATA_DIR.
+        
+        Args:
+            apply_smoothing: Aplicar OneEuroFilter
+            apply_normalization: Aplicar normalización relativa
+            full_reprocess: Si True, reprocesa todos. Si False, solo nuevos.
         """
         ensure_dirs()
         load_classes()
         
         # Recolectar todos los videos
         videos = []
+        skipped_existing = 0
+        
         for class_dir in RAW_DATA_DIR.iterdir():
             if not class_dir.is_dir():
                 continue
@@ -347,13 +355,25 @@ class VideoPreprocessor:
             class_name = class_dir.name
             for video_file in class_dir.glob("*.mp4"):
                 output_path = PROCESSED_DATA_DIR / class_name / (video_file.stem + ".npy")
+                
+                # En modo incremental, saltar si ya existe
+                if not full_reprocess and output_path.exists():
+                    skipped_existing += 1
+                    continue
+                
                 videos.append((video_file, output_path, class_name))
         
+        if skipped_existing > 0:
+            logger.info(f"⏭️ Saltados {skipped_existing} videos ya procesados")
+        
         if not videos:
-            logger.error(f"❌ No se encontraron videos en {RAW_DATA_DIR}")
+            if skipped_existing > 0:
+                logger.info("✅ Todos los videos ya están procesados")
+            else:
+                logger.error(f"❌ No se encontraron videos en {RAW_DATA_DIR}")
             return
         
-        logger.info(f"📂 Encontrados {len(videos)} videos para procesar")
+        logger.info(f"📂 Videos a procesar: {len(videos)}")
         
         # Estadísticas
         stats_total = {
@@ -365,6 +385,10 @@ class VideoPreprocessor:
         
         # Procesar con barra de progreso
         for video_path, output_path, class_name in tqdm(videos, desc="Procesando videos"):
+            # En modo full, eliminar existente primero
+            if full_reprocess and output_path.exists():
+                output_path.unlink()
+            
             result = self.process_video(
                 video_path,
                 output_path,
@@ -405,6 +429,18 @@ class VideoPreprocessor:
 
 def main():
     """Punto de entrada."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Preprocesador de videos LSM")
+    parser.add_argument(
+        "--full", 
+        action="store_true", 
+        help="Reprocesa todos los videos (ignora existentes)"
+    )
+    args = parser.parse_args()
+    
+    mode = "COMPLETO" if args.full else "INCREMENTAL"
+    
     print("=" * 60)
     print("🔄 LSM-Core Video Preprocessor")
     print("=" * 60)
@@ -413,12 +449,14 @@ def main():
     print(f"🎯 Model:  {RTMPOSE_MODEL}")
     print(f"🔧 Confidence Threshold: {CONFIDENCE_THRESHOLD}")
     print(f"🔧 Smoothing: min_cutoff={FILTER_MIN_CUTOFF}, beta={FILTER_BETA}")
+    print(f"📋 Modo: {mode}")
     print("=" * 60)
     
     preprocessor = VideoPreprocessor()
     preprocessor.process_all(
         apply_smoothing=True,
-        apply_normalization=True
+        apply_normalization=True,
+        full_reprocess=args.full
     )
     
     print("\n✅ Procesamiento completado!")
@@ -426,3 +464,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
