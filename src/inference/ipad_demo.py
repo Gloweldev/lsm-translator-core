@@ -1,7 +1,7 @@
 """
 Demo de Inferencia en Tiempo Real con iPad/DroidCam.
 
-Pipeline completo: RTMPose → Transformer → Predicción
+Pipeline completo: RTMPose → Transformer → FSM → Predicción + Gráfica Temporal
 Fuente de video: Cámara IP (DroidCam, EpocCam, etc.)
 
 Uso:
@@ -11,6 +11,7 @@ Controles:
     [Q] - Salir
     [R] - Reset buffer
     [S] - Screenshot
+    [C] - Clear historial
 """
 
 import cv2
@@ -19,8 +20,11 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from pathlib import Path
 from collections import deque
+from enum import Enum
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -58,12 +62,33 @@ WEBCAM_ID = 0
 # Clases (deben coincidir con el entrenamiento)
 CLASS_NAMES = ['a', 'b', 'c', 'hola', 'nada']
 
-# Inferencia
-PREDICTION_THRESHOLD = 0.85  # Confianza mínima para mostrar
-STABILITY_FRAMES = 5         # Frames consecutivos para estabilizar
-BUFFER_SIZE = MAX_SEQ_LEN    # 90 frames
+# FSM Thresholds
+TRIGGER_THRESHOLD = 0.85
+RELEASE_THRESHOLD = 0.50
+BUFFER_SIZE = MAX_SEQ_LEN
+MIN_FRAMES = 30
 
-# Visualización
+# Physical Veto - Índices de keypoints (COCO-WholeBody)
+LEFT_WRIST_IDX = 9
+RIGHT_WRIST_IDX = 10
+LEFT_HIP_IDX = 11
+RIGHT_HIP_IDX = 12
+POSE_MARGIN = 0.08  # Margen de seguridad (8% de altura) para señas bajas
+
+# Historial
+MAX_HISTORY = 5
+MAX_GRAPH_POINTS = 150  # Puntos max en la gráfica
+
+# Colores para gráfica
+COLORS = {
+    'a': '#2ecc71',
+    'b': '#3498db',
+    'c': '#9b59b6',
+    'hola': '#e74c3c',
+    'nada': '#95a5a6',
+}
+
+# Visualización esqueleto
 SKELETON_CONNECTIONS = [
     (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
     (5, 11), (6, 12), (11, 12),
@@ -79,8 +104,121 @@ HAND_CONNECTIONS = [
 ]
 
 
+# =============================================
+# VETO FÍSICO - Detección de Posición de Descanso
+# =============================================
+def is_pose_active(raw_keypoints: np.ndarray, frame_height: int) -> bool:
+    """
+    Determina si el usuario está en posición activa para señas.
+    
+    Retorna False (INACTIVO) si AMBAS muñecas están por debajo de las caderas.
+    Esto indica que el usuario tiene las manos abajo (posición de descanso).
+    
+    Args:
+        raw_keypoints: Vector de 266 dims (133 keypoints x 2)
+        frame_height: Altura del frame para calcular margen
+    
+    Returns:
+        True si está activo (al menos una mano arriba), False si en descanso
+    """
+    # Extraer coordenadas Y (recordar: Y mayor = más abajo en imagen)
+    left_wrist_y = raw_keypoints[LEFT_WRIST_IDX * 2 + 1]
+    right_wrist_y = raw_keypoints[RIGHT_WRIST_IDX * 2 + 1]
+    left_hip_y = raw_keypoints[LEFT_HIP_IDX * 2 + 1]
+    right_hip_y = raw_keypoints[RIGHT_HIP_IDX * 2 + 1]
+    
+    # Si no hay detección de keypoints, asumir activo
+    if left_hip_y == 0 and right_hip_y == 0:
+        return True
+    
+    # Calcular margen de seguridad (permite señas a la altura del ombligo)
+    margin = frame_height * POSE_MARGIN
+    
+    # Usar la cadera más alta detectada como referencia
+    hip_y = min(left_hip_y if left_hip_y > 0 else 9999, 
+               right_hip_y if right_hip_y > 0 else 9999)
+    
+    if hip_y == 9999:
+        return True  # No hay referencia de cadera
+    
+    # Umbral: cadera + margen (más abajo que la cadera)
+    threshold_y = hip_y + margin
+    
+    # Verificar si AMBAS muñecas están por debajo del umbral
+    # (Si una está a 0, significa no detectada - ignorar)
+    left_below = (left_wrist_y > threshold_y) if left_wrist_y > 0 else True
+    right_below = (right_wrist_y > threshold_y) if right_wrist_y > 0 else True
+    
+    # Inactivo solo si AMBAS manos están abajo Y al menos una fue detectada
+    both_detected = left_wrist_y > 0 or right_wrist_y > 0
+    
+    if left_below and right_below and both_detected:
+        return False  # Posición de descanso
+    
+    return True  # Al menos una mano activa
+
+
+# =============================================
+# FSM - MÁQUINA DE ESTADOS FINITA
+# =============================================
+class State(Enum):
+    IDLE = "IDLE"
+    ACTIVE = "ACTIVE"
+
+
+class WordFSM:
+    """Máquina de Estados para detección de palabras."""
+    
+    def __init__(self):
+        self.state = State.IDLE
+        self.last_word = None
+        self.word_history = deque(maxlen=MAX_HISTORY)
+    
+    def update(self, prediction: str, confidence: float) -> str:
+        if prediction is None:
+            return None
+        
+        new_word = None
+        
+        if self.state == State.IDLE:
+            if confidence > TRIGGER_THRESHOLD and prediction != "nada":
+                self.state = State.ACTIVE
+                self.last_word = prediction
+                self.word_history.append(prediction)
+                new_word = prediction
+                print(f"🎯 [{self.state.value}] Detectado: {prediction.upper()} ({confidence:.1%})")
+        
+        elif self.state == State.ACTIVE:
+            if confidence < RELEASE_THRESHOLD or prediction == "nada":
+                self.state = State.IDLE
+                self.last_word = None
+                print(f"⏸️ [{self.state.value}] Liberado")
+            elif prediction != self.last_word and confidence > TRIGGER_THRESHOLD:
+                self.last_word = prediction
+                self.word_history.append(prediction)
+                new_word = prediction
+                print(f"🔄 [{self.state.value}] Hot-Swap: {prediction.upper()} ({confidence:.1%})")
+        
+        return new_word
+    
+    def get_current_word(self) -> str:
+        if self.state == State.ACTIVE:
+            return self.last_word
+        return None
+    
+    def get_history(self) -> list:
+        return list(self.word_history)
+    
+    def clear_history(self):
+        self.word_history.clear()
+    
+    def reset(self):
+        self.state = State.IDLE
+        self.last_word = None
+
+
 class LSMInference:
-    """Pipeline de inferencia en tiempo real."""
+    """Pipeline de inferencia con gráfica temporal en tiempo real."""
     
     def __init__(self, model_path: str = None, device: str = None):
         if device is None:
@@ -90,21 +228,25 @@ class LSMInference:
         # Buffer de frames
         self.buffer = deque(maxlen=BUFFER_SIZE)
         
-        # Estabilización
-        self.last_prediction = None
-        self.stable_count = 0
-        self.stable_prediction = None
+        # FSM
+        self.fsm = WordFSM()
         
-        # Smoothers (OneEuroFilter por keypoint - igual que preprocessing)
+        # Historial de probabilidades para gráfica
+        self.prob_history = {cls: deque(maxlen=MAX_GRAPH_POINTS) for cls in CLASS_NAMES}
+        
+        # Smoothers
         self.smoothers = None
         self.frame_count = 0
+        
+        # Índices para normalización
+        self.LEFT_HIP_IDX = 11
+        self.RIGHT_HIP_IDX = 12
         
         # Cargar modelos
         self._load_rtmpose()
         self._load_transformer(model_path)
     
     def _load_rtmpose(self):
-        """Carga RTMPose."""
         print(f"🚀 Cargando RTMPose en {self.device}...")
         self.pose_inferencer = MMPoseInferencer(
             pose2d=RTMPOSE_MODEL,
@@ -113,18 +255,15 @@ class LSMInference:
         print("✅ RTMPose cargado")
     
     def _load_transformer(self, model_path: str = None):
-        """Carga el Transformer entrenado usando config del checkpoint."""
         if model_path is None:
             model_path = self._find_best_model()
         
         if model_path is None:
             raise FileNotFoundError("No se encontró modelo entrenado")
         
-        # Cargar checkpoint para obtener config
         checkpoint = torch.load(model_path, map_location=self.device)
         config = checkpoint.get('config', {})
         
-        # Mostrar info del modelo
         epoch = checkpoint.get('epoch', '?')
         val_acc = checkpoint.get('val_acc', 0)
         run_id = checkpoint.get('run_id', 'N/A')
@@ -134,50 +273,33 @@ class LSMInference:
         if run_id != 'N/A':
             print(f"   Run ID: {run_id}")
         
-        # Crear modelo con config del entrenamiento
         self.model = LSMTransformer(
             input_dim=config.get('input_dim', INPUT_DIM),
             num_classes=config.get('num_classes', len(CLASS_NAMES)),
             d_model=config.get('d_model', D_MODEL),
             nhead=config.get('n_heads', N_HEADS),
             num_layers=config.get('n_layers', N_LAYERS),
-            dropout=0.0,  # Sin dropout en inferencia
+            dropout=0.0,
             max_seq_len=config.get('max_seq_len', BUFFER_SIZE)
         ).to(self.device)
         
-        # Cargar pesos
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.eval()
-        print(f"✅ Transformer cargado")
+        print("✅ Transformer cargado")
     
     def _find_best_model(self) -> str:
-        """Busca el mejor modelo en mlruns."""
-        # Buscar best_model.pth
         best_model = MLRUNS_DIR / "best_model.pth"
         if best_model.exists():
             return str(best_model)
-        
-        # Buscar en subdirectorios
-        for pth_file in MLRUNS_DIR.rglob("best_model.pth"):
-            return str(pth_file)
-        
+        for p in MLRUNS_DIR.rglob("best_model.pth"):
+            return str(p)
         return None
     
     def _normalize_to_center(self, keypoints_flat: np.ndarray) -> np.ndarray:
-        """
-        Normaliza keypoints restando el centro de caderas.
-        Igual que en preprocessor.py para que coincida con el entrenamiento.
-        """
-        LEFT_HIP_IDX = 11
-        RIGHT_HIP_IDX = 12
-        
-        # Reconstruir a Nx2
         kp = keypoints_flat.reshape(-1, 2)
+        left_hip = kp[self.LEFT_HIP_IDX]
+        right_hip = kp[self.RIGHT_HIP_IDX]
         
-        left_hip = kp[LEFT_HIP_IDX]
-        right_hip = kp[RIGHT_HIP_IDX]
-        
-        # Calcular centro
         if np.any(left_hip != 0) and np.any(right_hip != 0):
             center = (left_hip + right_hip) / 2
         elif np.any(left_hip != 0):
@@ -188,18 +310,9 @@ class LSMInference:
             valid = kp[np.any(kp != 0, axis=1)]
             center = valid.mean(axis=0) if len(valid) > 0 else np.array([0.0, 0.0])
         
-        normalized = kp - center
-        return normalized.flatten()
+        return (kp - center).flatten()
     
     def extract_keypoints(self, frame) -> tuple:
-        """
-        Extrae keypoints del frame.
-        
-        Returns:
-            (raw_keypoints, normalized_keypoints)
-            - raw: para visualización
-            - normalized: para predicción
-        """
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = list(self.pose_inferencer(rgb, return_vis=False))
         
@@ -216,119 +329,127 @@ class LSMInference:
                         raw_keypoints[i*2] = kp[i, 0]
                         raw_keypoints[i*2 + 1] = kp[i, 1]
         
-        # Aplicar smoothing (OneEuroFilter - igual que preprocessing)
         self.frame_count += 1
-        t = self.frame_count / 30.0  # Timestamp en segundos (asume 30 fps)
+        t = self.frame_count / 30.0
         
         if self.smoothers is None:
-            # Inicializar filtros
-            self.smoothers = []
-            for i in range(INPUT_DIM):
-                self.smoothers.append(OneEuroFilter(
-                    t0=t, x0=raw_keypoints[i],
-                    min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA
-                ))
-            smoothed_keypoints = raw_keypoints.copy()
+            self.smoothers = [OneEuroFilter(t0=t, x0=raw_keypoints[i],
+                              min_cutoff=FILTER_MIN_CUTOFF, beta=FILTER_BETA)
+                              for i in range(INPUT_DIM)]
+            smoothed = raw_keypoints.copy()
         else:
-            smoothed_keypoints = np.array([self.smoothers[i](t, raw_keypoints[i]) for i in range(INPUT_DIM)])
+            smoothed = np.array([self.smoothers[i](t, raw_keypoints[i]) for i in range(INPUT_DIM)])
         
-        # Normalizar para predicción
-        normalized_keypoints = self._normalize_to_center(smoothed_keypoints.copy())
-        
-        return raw_keypoints, normalized_keypoints
+        return raw_keypoints, self._normalize_to_center(smoothed.copy())
     
     def predict(self) -> tuple:
-        """
-        Predice la seña actual.
-        Funciona con buffer parcial usando padding.
-        
-        Returns:
-            (class_name, confidence) o (None, 0) si no hay suficientes frames
-        """
-        MIN_FRAMES = 30  # Mínimo para predecir
-        
         if len(self.buffer) < MIN_FRAMES:
-            return None, 0.0
+            return None, 0.0, None
         
-        # Convertir buffer a array
         sequence = np.array(list(self.buffer))
         
-        # Padding si es necesario (para llegar a BUFFER_SIZE)
         if len(sequence) < BUFFER_SIZE:
             padding = np.zeros((BUFFER_SIZE - len(sequence), INPUT_DIM))
             sequence = np.vstack([sequence, padding])
         
         tensor = torch.FloatTensor(sequence).unsqueeze(0).to(self.device)
         
-        # Inferencia
         with torch.no_grad():
             logits = self.model(tensor)
             probs = F.softmax(logits, dim=1)
             confidence, predicted = probs.max(1)
         
-        class_idx = predicted.item()
-        conf = confidence.item()
+        probs_np = probs[0].cpu().numpy()
         
-        return CLASS_NAMES[class_idx], conf
+        # Guardar historial de probabilidades
+        for i, cls in enumerate(CLASS_NAMES):
+            self.prob_history[cls].append(probs_np[i])
+        
+        return CLASS_NAMES[predicted.item()], confidence.item(), probs_np
     
-    def stabilize(self, prediction: str, confidence: float) -> tuple:
-        """
-        Estabiliza la predicción para evitar parpadeo.
-        Solo muestra si la misma predicción se mantiene por N frames con alta confianza.
-        """
-        if confidence < PREDICTION_THRESHOLD:
-            self.stable_count = 0
-            return None, 0.0
+    def create_graph_image(self, current_class: str, width: int, height: int) -> np.ndarray:
+        """Crea imagen de la gráfica temporal."""
+        fig, ax = plt.subplots(figsize=(width/100, height/100), dpi=100)
+        fig.patch.set_facecolor('black')
+        ax.set_facecolor('black')
         
-        if prediction == self.last_prediction:
-            self.stable_count += 1
+        num_points = len(self.prob_history[CLASS_NAMES[0]])
+        
+        if num_points == 0:
+            ax.text(0.5, 0.5, 'Esperando...', ha='center', va='center', 
+                   fontsize=14, color='white')
         else:
-            self.stable_count = 1
-            self.last_prediction = prediction
+            frames = np.arange(num_points)
+            
+            for cls in CLASS_NAMES:
+                data = list(self.prob_history[cls])
+                if cls == current_class and current_class != "nada":
+                    ax.plot(frames, data, linewidth=3, 
+                           color=COLORS.get(cls, 'green'), label=cls.upper())
+                elif cls == 'nada':
+                    ax.plot(frames, data, linewidth=2, 
+                           color='gray', linestyle='--', alpha=0.7)
+                else:
+                    ax.plot(frames, data, linewidth=1, 
+                           alpha=0.3, color=COLORS.get(cls, 'blue'))
+            
+            # Umbral
+            ax.axhline(y=TRIGGER_THRESHOLD, color='red', linestyle='-', 
+                      linewidth=2, alpha=0.8, label=f'Umbral {TRIGGER_THRESHOLD:.0%}')
+            
+            ax.set_ylim(0, 1.05)
+            ax.set_xlim(0, max(num_points, 30))
+            ax.set_ylabel('Prob', color='white', fontsize=10)
+            ax.set_xlabel('Frame', color='white', fontsize=10)
+            ax.tick_params(colors='white')
+            ax.legend(loc='upper right', fontsize=8, facecolor='black', 
+                     labelcolor='white', framealpha=0.5)
+            ax.grid(True, alpha=0.2)
+            
+            for spine in ax.spines.values():
+                spine.set_color('gray')
         
-        if self.stable_count >= STABILITY_FRAMES:
-            self.stable_prediction = prediction
-            return prediction, confidence
+        plt.tight_layout()
         
-        # Mientras no sea estable, mantener la última predicción estable
-        if self.stable_prediction:
-            return self.stable_prediction, confidence
+        canvas = FigureCanvasAgg(fig)
+        canvas.draw()
         
-        return None, confidence
+        buf = canvas.buffer_rgba()
+        graph_img = np.asarray(buf)
+        graph_img = cv2.cvtColor(graph_img, cv2.COLOR_RGBA2BGR)
+        
+        plt.close(fig)
+        
+        return graph_img
     
     def reset(self):
-        """Reinicia el buffer y estabilización."""
         self.buffer.clear()
-        self.last_prediction = None
-        self.stable_count = 0
-        self.stable_prediction = None
+        self.fsm.reset()
+        self.smoothers = None
+        self.frame_count = 0
+        for cls in CLASS_NAMES:
+            self.prob_history[cls].clear()
     
     def draw_skeleton(self, frame, keypoints) -> np.ndarray:
-        """Dibuja el esqueleto sobre el frame usando keypoints RAW."""
         h, w = frame.shape[:2]
         
-        # Reconstruir puntos
         points = {}
         for i in range(KEYPOINTS_PER_FRAME):
             x = int(keypoints[i*2])
             y = int(keypoints[i*2 + 1])
-            if x > 0 or y > 0:  # Solo si no es (0,0)
+            if x > 0 or y > 0:
                 if 0 <= x < w and 0 <= y < h:
                     points[i] = (x, y)
                     cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
         
-        # Conexiones del cuerpo
         for i, j in SKELETON_CONNECTIONS:
             if i in points and j in points:
                 cv2.line(frame, points[i], points[j], (0, 200, 0), 2)
         
-        # Conexiones de manos
         for ci, cj in HAND_CONNECTIONS:
-            # Mano izquierda
             i, j = 91 + ci, 91 + cj
             if i in points and j in points:
                 cv2.line(frame, points[i], points[j], (255, 200, 0), 1)
-            # Mano derecha
             i, j = 112 + ci, 112 + cj
             if i in points and j in points:
                 cv2.line(frame, points[i], points[j], (200, 0, 255), 1)
@@ -337,19 +458,17 @@ class LSMInference:
 
 
 def run_demo():
-    """Ejecuta el demo de inferencia."""
+    """Ejecuta el demo con gráfica temporal en tiempo real."""
     print("=" * 60)
-    print("🤟 LSM-Core: Demo de Inferencia en Tiempo Real")
+    print("🤟 LSM-Core: Demo con Gráfica Temporal")
     print("=" * 60)
     
-    # Inicializar inferencia
     try:
         inference = LSMInference()
     except Exception as e:
         print(f"❌ Error inicializando: {e}")
         return
     
-    # Conectar a cámara
     if USE_WEBCAM:
         source = WEBCAM_ID
         print(f"📷 Usando webcam {WEBCAM_ID}")
@@ -361,16 +480,18 @@ def run_demo():
     
     if not cap.isOpened():
         print("❌ No se pudo conectar a la cámara")
-        print("   - Verifica que DroidCam esté activo")
-        print(f"   - Revisa la IP: {CAMERA_IP}:{CAMERA_PORT}")
         return
     
     print("✅ Cámara conectada")
-    print("\n🎮 Controles: [Q]Salir [R]Reset [S]Screenshot")
+    print("\n🎮 Controles: [Q]Salir [R]Reset [S]Screenshot [C]Clear")
     print("=" * 60)
     
     fps_counter = deque(maxlen=30)
     frame_count = 0
+    
+    # Dimensiones objetivo (video vertical)
+    TARGET_HEIGHT = 720
+    GRAPH_WIDTH = 400
     
     while True:
         start_time = time.time()
@@ -385,47 +506,116 @@ def run_demo():
         
         h, w = frame.shape[:2]
         
-        # Extraer keypoints (raw para visualización, normalized para predicción)
+        # Rotar si viene horizontal (ancho > alto)
+        if w > h:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            h, w = frame.shape[:2]
+        
+        # Escalar a altura objetivo
+        scale = TARGET_HEIGHT / h
+        new_w = int(w * scale)
+        frame = cv2.resize(frame, (new_w, TARGET_HEIGHT))
+        h, w = frame.shape[:2]
+        
+        # Extraer keypoints
         raw_keypoints, normalized_keypoints = inference.extract_keypoints(frame)
         
-        # Acumular normalized para predicción
-        inference.buffer.append(normalized_keypoints)
+        # =============================================
+        # VETO FÍSICO - Verificar posición de manos
+        # =============================================
+        pose_active = is_pose_active(raw_keypoints, h)
         
-        # Dibujar esqueleto con keypoints RAW
-        frame = inference.draw_skeleton(frame, raw_keypoints)
+        if pose_active:
+            # Posición activa - ejecutar inferencia normal
+            inference.buffer.append(normalized_keypoints)
+            
+            # Dibujar esqueleto (verde)
+            frame = inference.draw_skeleton(frame, raw_keypoints)
+            
+            # Predecir
+            prediction, confidence, probs = inference.predict()
+            
+            # Actualizar FSM
+            inference.fsm.update(prediction, confidence)
+            current_word = inference.fsm.get_current_word()
+            veto_active = False
+        else:
+            # Posición de descanso - VETO ACTIVO
+            # CRÍTICO: Limpiar buffer para matar memoria de seña anterior
+            if len(inference.buffer) > 0:
+                inference.buffer.clear()
+                inference.fsm.state = State.IDLE
+                inference.fsm.last_word = None
+                # Limpiar historial de probabilidades
+                for cls in CLASS_NAMES:
+                    inference.prob_history[cls].clear()
+            
+            # Dibujar esqueleto en gris (indicar veto)
+            frame = inference.draw_skeleton(frame, raw_keypoints)
+            
+            prediction = "nada"
+            confidence = 0.0
+            probs = None
+            current_word = None
+            veto_active = True
         
-        # Predecir
-        prediction, confidence = inference.predict()
-        stable_pred, stable_conf = inference.stabilize(prediction, confidence)
+        # =============================================
+        # UI sobre el video
+        # =============================================
         
-        # UI
+        # Header
         cv2.rectangle(frame, (0, 0), (w, 100), (0, 0, 0), -1)
         
-        # Buffer status
-        buffer_pct = len(inference.buffer) / BUFFER_SIZE * 100
-        cv2.putText(frame, f"Buffer: {len(inference.buffer)}/{BUFFER_SIZE}", (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-        cv2.rectangle(frame, (10, 35), (210, 50), (50, 50, 50), -1)
-        cv2.rectangle(frame, (10, 35), (10 + int(buffer_pct * 2), 50), (0, 255, 0), -1)
+        # Estado FSM + Veto
+        if veto_active:
+            cv2.putText(frame, "VETO", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.putText(frame, "(manos abajo)", (10, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        else:
+            state_color = (0, 255, 0) if inference.fsm.state == State.ACTIVE else (150, 150, 150)
+            cv2.putText(frame, f"{inference.fsm.state.value}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, state_color, 2)
         
-        # Predicción
-        if stable_pred:
-            color = (0, 255, 0) if stable_conf > 0.9 else (0, 255, 255)
-            cv2.putText(frame, stable_pred.upper(), (10, 90),
-                        cv2.FONT_HERSHEY_SIMPLEX, 2, color, 3)
-            cv2.putText(frame, f"{stable_conf:.1%}", (w - 120, 90),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-        elif prediction:
-            cv2.putText(frame, f"({prediction} {confidence:.1%})", (10, 90),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1)
+        # Palabra actual
+        if current_word:
+            cv2.putText(frame, current_word.upper(), (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+        elif prediction and prediction != "nada" and not veto_active:
+            cv2.putText(frame, f"({prediction})", (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (100, 100, 100), 2)
+        
+        # Confianza
+        if prediction and not veto_active:
+            cv2.putText(frame, f"{confidence:.0%}", (w - 80, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        # Historial (parte inferior)
+        history = inference.fsm.get_history()
+        if history:
+            cv2.rectangle(frame, (0, h - 50), (w, h), (0, 0, 0), -1)
+            history_text = " → ".join(history[-3:])
+            cv2.putText(frame, history_text, (10, h - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         # FPS
         fps_counter.append(1.0 / (time.time() - start_time + 1e-6))
         fps = np.mean(fps_counter)
-        cv2.putText(frame, f"FPS: {fps:.1f}", (w - 100, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(frame, f"FPS:{fps:.0f}", (w - 80, h - 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
         
-        cv2.imshow('LSM-Core Demo', frame)
+        # =============================================
+        # Crear gráfica temporal
+        # =============================================
+        target_class = current_word if current_word else (prediction if prediction else "nada")
+        graph_img = inference.create_graph_image(target_class, GRAPH_WIDTH, TARGET_HEIGHT)
+        
+        # =============================================
+        # Combinar video (izq) + gráfica (der)
+        # =============================================
+        combined = np.hstack([frame, graph_img])
+        
+        cv2.imshow('LSM-Core Demo + Temporal', combined)
         
         # Controles
         key = cv2.waitKey(1) & 0xFF
@@ -433,11 +623,14 @@ def run_demo():
             break
         elif key == ord('r'):
             inference.reset()
-            print("🔄 Buffer reiniciado")
+            print("🔄 Reset completo")
         elif key == ord('s'):
             filename = f"screenshot_{frame_count}.png"
-            cv2.imwrite(filename, frame)
+            cv2.imwrite(filename, combined)
             print(f"📸 Guardado: {filename}")
+        elif key == ord('c'):
+            inference.fsm.clear_history()
+            print("🗑️ Historial limpio")
         
         frame_count += 1
     

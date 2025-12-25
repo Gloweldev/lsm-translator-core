@@ -68,10 +68,16 @@ from src.models.transformer import LSMTransformer
 
 
 # =============================================
-# DATASET CON AUGMENTACIÓN
+# DATASET CON AUGMENTACIÓN TEMPORAL
 # =============================================
 class LSMDataset(Dataset):
-    """Dataset para secuencias de keypoints LSM con augmentación."""
+    """
+    Dataset para secuencias de keypoints LSM con augmentación temporal.
+    
+    La augmentación temporal (Random Crop) es crítica para evitar el 
+    "Bias de Retorno al Reposo" - donde el modelo solo detecta señas
+    cuando las manos bajan al final del video.
+    """
     
     def __init__(self, sequences, labels, max_len=MAX_SEQ_LEN, augment=False):
         self.sequences = sequences
@@ -86,9 +92,10 @@ class LSMDataset(Dataset):
         seq = self.sequences[idx].copy()
         label = self.labels[idx]
         
-        # Augmentación (solo en entrenamiento)
+        # Augmentación temporal (solo en entrenamiento)
         if self.augment:
-            seq = self._augment(seq)
+            seq = self._apply_temporal_augmentation(seq)
+            seq = self._apply_feature_augmentation(seq)
         
         # Truncar o hacer padding
         if len(seq) > self.max_len:
@@ -99,25 +106,59 @@ class LSMDataset(Dataset):
         
         return torch.FloatTensor(seq), torch.LongTensor([label])[0]
     
-    def _augment(self, seq):
-        """Augmentación simple para regularización."""
-        # 1. Ruido gaussiano
+    def _apply_temporal_augmentation(self, seq):
+        """
+        Augmentación temporal para evitar bias de 'retorno al reposo'.
+        
+        El modelo debe aprender a detectar la seña DURANTE el gesto,
+        no solo cuando las manos bajan al final.
+        """
+        original_len = len(seq)
+        
+        # Skip si muy corto
+        if original_len < 30:
+            return seq
+        
+        # 1. RANDOM CROP (50% prob) - CRÍTICO para evitar bias
+        # Simula que el video se cortó antes de que las manos bajen
+        if np.random.random() < 0.5:
+            # Tamaño de ventana: 70% - 100% del original
+            crop_ratio = np.random.uniform(0.7, 1.0)
+            crop_len = max(30, int(original_len * crop_ratio))
+            
+            # Punto de inicio aleatorio
+            max_start = original_len - crop_len
+            if max_start > 0:
+                start_idx = np.random.randint(0, max_start + 1)
+                seq = seq[start_idx:start_idx + crop_len]
+        
+        # 2. TIME WARPING (30% prob) - Simula velocidad variable
+        if np.random.random() < 0.3:
+            speed = np.random.uniform(0.8, 1.2)
+            new_len = max(20, int(len(seq) / speed))
+            indices = np.linspace(0, len(seq) - 1, new_len)
+            indices = np.clip(indices.astype(int), 0, len(seq) - 1)
+            seq = seq[indices]
+        
+        # 3. RANDOM START OFFSET (30% prob) - Simula inicio tardío
+        if np.random.random() < 0.3 and len(seq) > 40:
+            offset = np.random.randint(0, min(20, len(seq) // 4))
+            seq = seq[offset:]
+        
+        return seq
+    
+    def _apply_feature_augmentation(self, seq):
+        """Augmentación de features (ruido, dropout)."""
+        # 1. Ruido gaussiano (50% prob)
         if np.random.random() < 0.5:
             noise = np.random.normal(0, 0.02, seq.shape)
             mask = seq != 0
             seq = seq + noise * mask
         
-        # 2. Escalado temporal
-        if np.random.random() < 0.3:
-            scale = np.random.uniform(0.8, 1.2)
-            indices = np.linspace(0, len(seq)-1, int(len(seq) * scale))
-            indices = np.clip(indices.astype(int), 0, len(seq)-1)
-            seq = seq[indices]
-        
-        # 3. Dropout de frames
-        if np.random.random() < 0.2:
+        # 2. Dropout de frames (20% prob)
+        if np.random.random() < 0.2 and len(seq) > 20:
             drop_mask = np.random.random(len(seq)) > 0.1
-            if drop_mask.sum() > 10:
+            if drop_mask.sum() > 15:
                 seq = seq[drop_mask]
         
         return seq
@@ -363,6 +404,16 @@ def main():
     with mlflow.start_run(run_name=f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
         mlflow.log_params(config)
         mlflow.log_param("class_names", CLASS_NAMES)
+        
+        # Guardar código fuente como artifacts
+        code_files = [
+            Path(__file__),  # train.py
+            Path(__file__).parent.parent / "models" / "transformer.py",
+            Path(__file__).parent.parent / "config" / "settings.py",
+        ]
+        for code_file in code_files:
+            if code_file.exists():
+                mlflow.log_artifact(str(code_file), artifact_path="source_code")
         
         best_val_acc = 0
         patience_counter = 0
