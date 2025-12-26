@@ -51,7 +51,7 @@ from mmpose.apis import MMPoseInferencer
 # CONFIGURACIÓN
 # =============================================
 # Cámara IP (DroidCam/EpocCam)
-CAMERA_IP = "192.168.100.104"
+CAMERA_IP = "192.168.100.123"
 CAMERA_PORT = 4747
 CAMERA_URL = f"http://{CAMERA_IP}:{CAMERA_PORT}/video"
 
@@ -67,6 +67,10 @@ TRIGGER_THRESHOLD = 0.85
 RELEASE_THRESHOLD = 0.50
 BUFFER_SIZE = MAX_SEQ_LEN
 MIN_FRAMES = 30
+
+# FPS Normalization - Compensar diferencia entre entrenamiento y tiempo real
+TRAINING_FPS = 30  # FPS asumido durante entrenamiento
+FPS_SMOOTHING = 10  # Frames para calcular FPS promedio
 
 # Physical Veto - Índices de keypoints (COCO-WholeBody)
 LEFT_WRIST_IDX = 9
@@ -367,6 +371,57 @@ class LSMInference:
         
         return CLASS_NAMES[predicted.item()], confidence.item(), probs_np
     
+    def predict_with_analysis(self) -> dict:
+        """
+        Predicción con análisis de interpretabilidad.
+        
+        Returns:
+            dict con predicción, confianza, todas las probabilidades,
+            importancia por frame, y importancia por región del cuerpo.
+        """
+        if len(self.buffer) < MIN_FRAMES:
+            return None
+        
+        sequence = np.array(list(self.buffer))
+        actual_frames = len(sequence)
+        
+        if len(sequence) < BUFFER_SIZE:
+            padding = np.zeros((BUFFER_SIZE - len(sequence), INPUT_DIM))
+            sequence = np.vstack([sequence, padding])
+        
+        tensor = torch.FloatTensor(sequence).unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            analysis = self.model.forward_with_analysis(tensor)
+            logits = analysis['logits']
+            probs = F.softmax(logits, dim=1)
+            confidence, predicted = probs.max(1)
+        
+        probs_np = probs[0].cpu().numpy()
+        
+        # Ordenar clases por probabilidad
+        sorted_indices = np.argsort(probs_np)[::-1]
+        ranked_classes = [(CLASS_NAMES[i], probs_np[i]) for i in sorted_indices]
+        
+        # Encontrar frames más importantes (últimos 'actual_frames')
+        frame_importance = analysis['frame_importance'][:actual_frames]
+        top_frame_idx = np.argmax(frame_importance)
+        
+        # Guardar historial
+        for i, cls in enumerate(CLASS_NAMES):
+            self.prob_history[cls].append(probs_np[i])
+        
+        return {
+            'prediction': CLASS_NAMES[predicted.item()],
+            'confidence': confidence.item(),
+            'all_probs': probs_np,
+            'ranked_classes': ranked_classes,
+            'frame_importance': frame_importance,
+            'peak_frame': top_frame_idx,
+            'region_importance': analysis['region_importance'],
+            'actual_frames': actual_frames
+        }
+    
     def create_graph_image(self, current_class: str, width: int, height: int) -> np.ndarray:
         """Crea imagen de la gráfica temporal."""
         fig, ax = plt.subplots(figsize=(width/100, height/100), dpi=100)
@@ -457,6 +512,85 @@ class LSMInference:
         return frame
 
 
+def draw_diagnostic_panel(frame, analysis: dict, w: int, h: int) -> np.ndarray:
+    """
+    Dibuja panel de diagnóstico mostrando por qué el modelo tomó su decisión.
+    """
+    if analysis is None:
+        return frame
+    
+    # Panel semi-transparente a la izquierda
+    panel_width = 200
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 100), (panel_width, h - 50), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+    
+    y_offset = 130
+    
+    # Título
+    cv2.putText(frame, "DIAGNOSTICO", (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+    y_offset += 30
+    
+    # Todas las probabilidades (rankeadas)
+    cv2.putText(frame, "Probabilidades:", (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+    y_offset += 20
+    
+    for cls_name, prob in analysis['ranked_classes']:
+        # Barra de probabilidad
+        bar_width = int(prob * 150)
+        
+        # Color según clase
+        if cls_name == analysis['prediction']:
+            color = (0, 255, 0)  # Verde para predicción
+        elif prob > 0.2:
+            color = (0, 200, 255)  # Amarillo para alternativas
+        else:
+            color = (100, 100, 100)  # Gris para bajas
+        
+        cv2.rectangle(frame, (10, y_offset - 12), (10 + bar_width, y_offset + 2), color, -1)
+        cv2.putText(frame, f"{cls_name}: {prob:.0%}", (15, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        y_offset += 22
+    
+    y_offset += 10
+    
+    # Información de frames
+    cv2.putText(frame, f"Frames: {analysis['actual_frames']}/{BUFFER_SIZE}", (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+    y_offset += 20
+    
+    cv2.putText(frame, f"Pico: frame {analysis['peak_frame']}", (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+    y_offset += 30
+    
+    # Importancia por región
+    cv2.putText(frame, "Regiones:", (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+    y_offset += 20
+    
+    region_labels = {
+        'left_hand': 'Mano Izq',
+        'right_hand': 'Mano Der',
+        'body': 'Cuerpo',
+        'face': 'Cara',
+        'feet': 'Pies'
+    }
+    
+    for region, label in region_labels.items():
+        imp = analysis['region_importance'].get(region, 0)
+        bar_width = int(min(imp, 3) / 3 * 100)  # Normalizar a max 3
+        
+        color = (0, 200, 0) if imp > 1.5 else (100, 100, 100)
+        cv2.rectangle(frame, (10, y_offset - 10), (10 + bar_width, y_offset), color, -1)
+        cv2.putText(frame, f"{label}: {imp:.1f}", (15, y_offset - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+        y_offset += 18
+    
+    return frame
+
+
 def run_demo():
     """Ejecuta el demo con gráfica temporal en tiempo real."""
     print("=" * 60)
@@ -483,11 +617,12 @@ def run_demo():
         return
     
     print("✅ Cámara conectada")
-    print("\n🎮 Controles: [Q]Salir [R]Reset [S]Screenshot [C]Clear")
+    print("\n🎮 Controles: [Q]Salir [R]Reset [S]Screenshot [C]Clear [D]Diagnóstico")
     print("=" * 60)
     
     fps_counter = deque(maxlen=30)
     frame_count = 0
+    diagnostic_mode = True  # Inicia con diagnóstico activo (toggle con D)
     
     # Dimensiones objetivo (video vertical)
     TARGET_HEIGHT = 720
@@ -525,15 +660,38 @@ def run_demo():
         # =============================================
         pose_active = is_pose_active(raw_keypoints, h)
         
+        # =============================================
+        # NORMALIZACIÓN DE FPS - Duplicar frames si FPS < 30
+        # Esto compensa que el modelo fue entrenado a ~30 FPS
+        # =============================================
+        fps_counter.append(1.0 / (time.time() - start_time + 1e-6))
+        current_fps = np.mean(list(fps_counter)[-FPS_SMOOTHING:])
+        
+        # Calcular cuántas veces duplicar el frame
+        duplicate_factor = max(1, round(TRAINING_FPS / max(current_fps, 1)))
+        
         if pose_active:
             # Posición activa - ejecutar inferencia normal
-            inference.buffer.append(normalized_keypoints)
+            # Duplicar frame para compensar FPS bajo
+            for _ in range(duplicate_factor):
+                inference.buffer.append(normalized_keypoints)
             
             # Dibujar esqueleto (verde)
             frame = inference.draw_skeleton(frame, raw_keypoints)
             
-            # Predecir
-            prediction, confidence, probs = inference.predict()
+            # Predecir (con o sin análisis)
+            if diagnostic_mode:
+                analysis = inference.predict_with_analysis()
+                if analysis:
+                    prediction = analysis['prediction']
+                    confidence = analysis['confidence']
+                    probs = analysis['all_probs']
+                else:
+                    prediction, confidence, probs = None, 0.0, None
+                    analysis = None
+            else:
+                prediction, confidence, probs = inference.predict()
+                analysis = None
             
             # Actualizar FSM
             inference.fsm.update(prediction, confidence)
@@ -558,6 +716,7 @@ def run_demo():
             probs = None
             current_word = None
             veto_active = True
+            analysis = None  # No hay análisis en veto
         
         # =============================================
         # UI sobre el video
@@ -598,11 +757,16 @@ def run_demo():
             cv2.putText(frame, history_text, (10, h - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
-        # FPS
-        fps_counter.append(1.0 / (time.time() - start_time + 1e-6))
-        fps = np.mean(fps_counter)
-        cv2.putText(frame, f"FPS:{fps:.0f}", (w - 80, h - 60),
+        # FPS y Factor de duplicación
+        fps = current_fps  # Ya calculado arriba
+        cv2.putText(frame, f"FPS:{fps:.0f} x{duplicate_factor}", (w - 120, h - 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        
+        # =============================================
+        # Panel de diagnóstico (si está activo)
+        # =============================================
+        if diagnostic_mode and analysis:
+            frame = draw_diagnostic_panel(frame, analysis, w, h)
         
         # =============================================
         # Crear gráfica temporal
@@ -631,6 +795,10 @@ def run_demo():
         elif key == ord('c'):
             inference.fsm.clear_history()
             print("🗑️ Historial limpio")
+        elif key == ord('d'):
+            diagnostic_mode = not diagnostic_mode
+            status = "✅ ACTIVADO" if diagnostic_mode else "❌ DESACTIVADO"
+            print(f"🔍 Modo diagnóstico: {status}")
         
         frame_count += 1
     

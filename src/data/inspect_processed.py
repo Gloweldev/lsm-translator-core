@@ -6,6 +6,7 @@ Valida los archivos .npy generados por el preprocessor:
     2. No sean puros ceros
     3. Longitud de secuencia adecuada
     4. Sin valores NaN/Inf
+    5. Análisis de FPS de videos originales
 
 Genera reporte y class weights para entrenamiento balanceado.
 
@@ -14,6 +15,7 @@ Uso:
 """
 
 import sys
+import cv2
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
@@ -21,7 +23,7 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.config.settings import PROCESSED_DATA_DIR, INPUT_DIM, MIN_SEQ_LEN, MAX_SEQ_LEN
+from src.config.settings import PROCESSED_DATA_DIR, RAW_DATA_DIR, INPUT_DIM, MIN_SEQ_LEN, MAX_SEQ_LEN, CLASS_NAMES
 
 # Configuración de validación
 EXPECTED_FEATURES = INPUT_DIM  # 266 (133 * 2)
@@ -92,6 +94,171 @@ def validate_tensor(filepath: Path) -> dict:
         result['errors'].append(f"Error de lectura: {str(e)}")
     
     return result
+
+
+def get_video_fps(video_path: Path) -> tuple:
+    """
+    Obtiene FPS y frame count de un video.
+    
+    Returns:
+        (fps, frame_count) o (None, None) si hay error
+    """
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return None, None
+        
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        
+        # Validar datos
+        if fps <= 0 or fps > 120:
+            fps = None
+        if frame_count <= 0:
+            frame_count = None
+            
+        return fps, frame_count
+    except:
+        return None, None
+
+
+def analyze_raw_videos_fps():
+    """
+    Analiza FPS de todos los videos en el directorio raw.
+    
+    Returns:
+        Dict con estadísticas de FPS
+    """
+    print("\n" + "=" * 70)
+    print("🎬 ANÁLISIS DE FPS DE VIDEOS ORIGINALES")
+    print("=" * 70)
+    
+    if not RAW_DATA_DIR.exists():
+        print(f"❌ No existe directorio raw: {RAW_DATA_DIR}")
+        return None
+    
+    fps_values = []
+    frame_counts = []
+    fps_distribution = defaultdict(int)  # FPS -> count
+    class_fps = defaultdict(list)  # class -> [fps, fps, ...]
+    video_details = []  # [(path, fps, frames), ...]
+    
+    total_videos = 0
+    errors = 0
+    
+    for class_name in CLASS_NAMES:
+        class_dir = RAW_DATA_DIR / class_name
+        if not class_dir.exists():
+            continue
+        
+        for video_file in class_dir.glob("*.mp4"):
+            total_videos += 1
+            fps, frames = get_video_fps(video_file)
+            
+            if fps is not None:
+                fps_values.append(fps)
+                fps_rounded = round(fps)
+                fps_distribution[fps_rounded] += 1
+                class_fps[class_name].append(fps)
+                video_details.append((video_file.name, class_name, fps, frames))
+                
+                if frames is not None:
+                    frame_counts.append(frames)
+            else:
+                errors += 1
+    
+    if not fps_values:
+        print("❌ No se pudieron leer los videos")
+        return None
+    
+    fps_arr = np.array(fps_values)
+    
+    # Estadísticas
+    print(f"\n📂 Directorio: {RAW_DATA_DIR}")
+    print(f"📹 Total videos escaneados: {total_videos}")
+    print(f"✅ Videos leídos correctamente: {len(fps_values)}")
+    print(f"❌ Videos con error: {errors}")
+    
+    print("\n" + "-" * 70)
+    print("📊 DISTRIBUCIÓN DE FPS")
+    print("-" * 70)
+    
+    for fps_val in sorted(fps_distribution.keys()):
+        count = fps_distribution[fps_val]
+        pct = count / len(fps_values) * 100
+        bar = "█" * min(50, int(pct / 2))
+        print(f"  {fps_val:3d} FPS | {count:4d} videos ({pct:5.1f}%) | {bar}")
+    
+    print("\n" + "-" * 70)
+    print("📈 ESTADÍSTICAS DE FPS")
+    print("-" * 70)
+    print(f"  Mínimo:    {fps_arr.min():6.1f} FPS")
+    print(f"  Máximo:    {fps_arr.max():6.1f} FPS")
+    print(f"  Promedio:  {fps_arr.mean():6.1f} FPS")
+    print(f"  Mediana:   {np.median(fps_arr):6.1f} FPS")
+    print(f"  Moda:      {max(fps_distribution, key=fps_distribution.get)} FPS")
+    print(f"  Std:       {fps_arr.std():6.1f}")
+    
+    # FPS por clase
+    print("\n" + "-" * 70)
+    print("📊 FPS PROMEDIO POR CLASE")
+    print("-" * 70)
+    for cls in sorted(class_fps.keys()):
+        fps_list = class_fps[cls]
+        avg_fps = np.mean(fps_list)
+        min_fps = np.min(fps_list)
+        max_fps = np.max(fps_list)
+        print(f"  {cls:10s} | Avg: {avg_fps:5.1f} | Min: {min_fps:5.1f} | Max: {max_fps:5.1f} | Videos: {len(fps_list)}")
+    
+    # Recomendación
+    print("\n" + "-" * 70)
+    print("🎯 RECOMENDACIÓN PARA INFERENCIA")
+    print("-" * 70)
+    most_common_fps = max(fps_distribution, key=fps_distribution.get)
+    print(f"  FPS más común: {most_common_fps} FPS")
+    print(f"  Configurar TRAINING_FPS = {most_common_fps} en ipad_demo.py")
+    
+    if fps_arr.std() > 5:
+        print("\n  ⚠️ ADVERTENCIA: Alta variación en FPS de videos de entrenamiento")
+        print("     El modelo puede tener inconsistencias temporales.")
+    
+    # Histograma de FPS
+    print("\n" + "-" * 70)
+    print("📊 Generando histograma de FPS...")
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Histograma de FPS
+    axes[0].hist(fps_values, bins=range(int(min(fps_values))-1, int(max(fps_values))+3), 
+                 edgecolor='black', alpha=0.7, color='steelblue')
+    axes[0].axvline(np.mean(fps_values), color='green', linestyle='-', 
+                   label=f'Mean ({np.mean(fps_values):.0f})')
+    axes[0].axvline(30, color='red', linestyle='--', label='30 FPS (target)')
+    axes[0].set_xlabel('FPS')
+    axes[0].set_ylabel('Cantidad de Videos')
+    axes[0].set_title('Distribución de FPS en Videos de Entrenamiento')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # Pie chart de FPS distribution
+    labels = [f"{fps} FPS" for fps in sorted(fps_distribution.keys())]
+    sizes = [fps_distribution[fps] for fps in sorted(fps_distribution.keys())]
+    axes[1].pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
+    axes[1].set_title('Proporción por FPS')
+    
+    output_path = PROCESSED_DATA_DIR.parent / "fps_analysis.png"
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"  Guardado en: {output_path}")
+    plt.close()
+    
+    return {
+        'fps_values': fps_values,
+        'fps_distribution': dict(fps_distribution),
+        'mean_fps': float(fps_arr.mean()),
+        'most_common_fps': most_common_fps
+    }
 
 
 def calculate_class_weights(class_counts: dict) -> dict:
@@ -228,10 +395,10 @@ def run_inspection():
         if len(errors) > 15:
             print(f"  ... y {len(errors) - 15} más")
     
-    # Histograma
+    # Histograma de frames
     if frame_lengths:
         print("\n" + "-" * 70)
-        print("📊 Generando histograma...")
+        print("📊 Generando histograma de frames...")
         
         plt.figure(figsize=(10, 6))
         plt.hist(frame_lengths, bins=30, edgecolor='black', alpha=0.7, color='steelblue')
@@ -250,6 +417,11 @@ def run_inspection():
         print(f"  Guardado en: {output_path}")
         plt.close()
     
+    # =============================================
+    # ANÁLISIS DE FPS
+    # =============================================
+    fps_result = analyze_raw_videos_fps()
+    
     print("\n" + "=" * 70)
     print("✅ Inspección completada")
     print("=" * 70)
@@ -257,3 +429,4 @@ def run_inspection():
 
 if __name__ == "__main__":
     run_inspection()
+

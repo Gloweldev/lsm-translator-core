@@ -5,7 +5,12 @@ Toma videos aleatorios de dataset/raw y muestra las predicciones
 para validar que el modelo está funcionando correctamente.
 
 Uso:
+    # Videos aleatorios del dataset
     python -m src.inference.video_demo
+    
+    # Video específico
+    python -m src.inference.video_demo --video path/to/video.mp4
+    python -m src.inference.video_demo -v path/to/video.mp4
 
 Controles:
     [Q] - Salir
@@ -17,6 +22,7 @@ import cv2
 import sys
 import time
 import random
+import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -259,19 +265,63 @@ def find_videos():
     return videos
 
 
-def run_demo():
+def run_demo(video_path: str = None):
+    """Ejecuta el demo.
+    
+    Args:
+        video_path: Ruta a un video específico (opcional). Si es None, usa videos aleatorios.
+    """
     print("=" * 60)
-    print("🎥 Demo de Validación con Videos del Dataset")
+    print("🎬 Demo de Validación con Videos")
     print("=" * 60)
     
-    # Buscar videos
-    all_videos = find_videos()
-    if not all_videos:
-        print("❌ No hay videos en dataset/raw/")
-        return
+    # Formatos soportados
+    SUPPORTED_FORMATS = ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v']
     
-    selected = random.sample(all_videos, min(NUM_VIDEOS, len(all_videos)))
-    print(f"📂 Seleccionados {len(selected)} videos aleatorios\n")
+    # Determinar videos a procesar
+    if video_path:
+        # Video específico
+        video_file = Path(video_path)
+        if not video_file.exists():
+            print(f"❌ Video no encontrado: {video_path}")
+            return
+        
+        # Verificar formato
+        ext = video_file.suffix.lower()
+        if ext not in SUPPORTED_FORMATS:
+            print(f"⚠️ Formato {ext} no probado. Formatos soportados: {SUPPORTED_FORMATS}")
+            print("   Intentando abrir de todas formas...")
+        
+        # Verificar que OpenCV puede abrir el video
+        test_cap = cv2.VideoCapture(str(video_file))
+        if not test_cap.isOpened():
+            print(f"❌ No se pudo abrir el video: {video_path}")
+            print("   Si es .mov de iPhone, puede necesitar codecs adicionales.")
+            print("   Intenta convertir con: ffmpeg -i input.mov -c:v libx264 output.mp4")
+            test_cap.release()
+            return
+        
+        fps = test_cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(test_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = frame_count / fps if fps > 0 else 0
+        test_cap.release()
+        
+        # Intentar determinar clase del path
+        true_class = video_file.parent.name if video_file.parent.name in CLASS_NAMES else "desconocida"
+        selected = [(video_file, true_class)]
+        print(f"🎬 Video: {video_path}")
+        print(f"   Formato: {ext}")
+        print(f"   FPS: {fps:.1f}, Frames: {frame_count}, Duración: {duration:.1f}s")
+        print(f"   Clase detectada: {true_class.upper()}")
+    else:
+        # Videos aleatorios del dataset
+        all_videos = find_videos()
+        if not all_videos:
+            print("❌ No hay videos en dataset/raw/")
+            return
+        
+        selected = random.sample(all_videos, min(NUM_VIDEOS, len(all_videos)))
+        print(f"📂 Seleccionados {len(selected)} videos aleatorios\n")
     
     # Inicializar
     try:
@@ -307,6 +357,11 @@ def run_demo():
                     break
                 
                 h, w = frame.shape[:2]
+                
+                # Auto-rotar si viene horizontal pero debería ser vertical (iPhone .mov)
+                if w > h:
+                    frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+                    h, w = frame.shape[:2]
                 
                 # Extraer keypoints (raw para visualización, normalized para predicción)
                 raw_keypoints, normalized_keypoints = validator.extract_keypoints(frame)
@@ -405,4 +460,9 @@ def run_demo():
 
 
 if __name__ == "__main__":
-    run_demo()
+    parser = argparse.ArgumentParser(description="Demo de validación con videos")
+    parser.add_argument("-v", "--video", type=str, default=None,
+                       help="Ruta a un video específico (opcional)")
+    args = parser.parse_args()
+    
+    run_demo(video_path=args.video)

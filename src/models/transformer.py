@@ -132,6 +132,7 @@ class LSMTransformer(nn.Module):
         super().__init__()
         
         self.d_model = d_model
+        self.input_dim = input_dim
         
         # 1. Feature-Weighted Embedding
         self.input_embedding = FeatureWeightedEmbedding(input_dim, d_model, dropout)
@@ -192,6 +193,73 @@ class LSMTransformer(nn.Module):
         
         return x
     
+    def forward_with_analysis(self, x: torch.Tensor) -> dict:
+        """
+        Forward pass con análisis de interpretabilidad.
+        
+        Retorna logits + información de diagnóstico:
+        - Importancia temporal (qué frames influyeron más)
+        - Feature weights (pesos por región del cuerpo)
+        
+        Args:
+            x: [Batch, Seq_Len, Input_Dim] - Secuencia de landmarks
+            
+        Returns:
+            dict con 'logits', 'frame_importance', 'feature_weights', 'region_importance'
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # Guardar input original para análisis
+        input_norms = torch.norm(x, dim=2)  # [Batch, Seq_Len] - Norma por frame
+        
+        # 1. Embedding con pesos por feature
+        x_embedded = self.input_embedding(x)
+        
+        # Calcular importancia por frame después del embedding
+        embedded_norms = torch.norm(x_embedded, dim=2)  # [Batch, Seq_Len]
+        
+        # 2. Positional Encoding
+        x = self.pos_encoder(x_embedded)
+        
+        # 3. Transformer Encoder
+        x = self.transformer_encoder(x)
+        
+        # Calcular importancia temporal (qué frames contribuyeron más)
+        # Usando la norma de las representaciones post-transformer
+        frame_importance = torch.norm(x, dim=2)  # [Batch, Seq_Len]
+        frame_importance = frame_importance / (frame_importance.sum(dim=1, keepdim=True) + 1e-8)
+        
+        # 4. Global Average Pooling
+        x_pooled = x.mean(dim=1)
+        
+        # 5. Classification
+        logits = self.classifier(x_pooled)
+        
+        # Obtener pesos de features (por región del cuerpo)
+        feature_weights = self.input_embedding.feature_weights.data.cpu().numpy()
+        
+        # Calcular importancia por región
+        # Body: 0-33, Feet: 34-45, Face: 46-181, Left Hand: 182-223, Right Hand: 224-265
+        regions = {
+            'body': (0, 34),
+            'feet': (34, 46),
+            'face': (46, 182),
+            'left_hand': (182, 224),
+            'right_hand': (224, 266)
+        }
+        
+        region_importance = {}
+        for region, (start, end) in regions.items():
+            region_importance[region] = float(feature_weights[start:end].mean())
+        
+        return {
+            'logits': logits,
+            'frame_importance': frame_importance[0].cpu().numpy(),  # [Seq_Len]
+            'input_activity': input_norms[0].cpu().numpy(),  # [Seq_Len] - Actividad de input
+            'feature_weights': feature_weights,
+            'region_importance': region_importance
+        }
+    
     def count_parameters(self) -> int:
         """Cuenta el número total de parámetros entrenables."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -207,3 +275,4 @@ def create_model(device: str = 'cuda') -> LSMTransformer:
     model = model.to(device)
     print(f"📊 Modelo creado con {model.count_parameters():,} parámetros")
     return model
+

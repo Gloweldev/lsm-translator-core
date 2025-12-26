@@ -132,9 +132,24 @@ class LSMDataset(Dataset):
                 start_idx = np.random.randint(0, max_start + 1)
                 seq = seq[start_idx:start_idx + crop_len]
         
-        # 2. TIME WARPING (30% prob) - Simula velocidad variable
-        if np.random.random() < 0.3:
-            speed = np.random.uniform(0.8, 1.2)
+        # 2. FPS/TIME WARPING (50% prob) - Simula diferentes FPS
+        # Rango 0.5x-2.0x cubre: 15 FPS, 30 FPS, 60 FPS
+        # 0.5x = video lento (60 FPS original → simula 30 FPS)
+        # 2.0x = video rápido (15 FPS original → simula 30 FPS)
+        if np.random.random() < 0.5:
+            # Elegir tipo de warping
+            warp_type = np.random.choice(['slow', 'normal', 'fast'], p=[0.3, 0.4, 0.3])
+            
+            if warp_type == 'slow':
+                # Simula video grabado a 60 FPS (más frames de lo normal)
+                speed = np.random.uniform(0.5, 0.7)
+            elif warp_type == 'fast':
+                # Simula video grabado a 15 FPS (menos frames, como real-time)
+                speed = np.random.uniform(1.5, 2.0)
+            else:
+                # Velocidad normal con pequeña variación
+                speed = np.random.uniform(0.9, 1.1)
+            
             new_len = max(20, int(len(seq) / speed))
             indices = np.linspace(0, len(seq) - 1, new_len)
             indices = np.clip(indices.astype(int), 0, len(seq) - 1)
