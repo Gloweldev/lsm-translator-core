@@ -97,6 +97,9 @@ class LSMDataset(Dataset):
             seq = self._apply_temporal_augmentation(seq)
             seq = self._apply_feature_augmentation(seq)
         
+        # Guardar duración ANTES del padding
+        duration = min(len(seq), self.max_len)
+        
         # Truncar o hacer padding
         if len(seq) > self.max_len:
             seq = seq[:self.max_len]
@@ -104,7 +107,7 @@ class LSMDataset(Dataset):
             padding = np.zeros((self.max_len - len(seq), seq.shape[1]))
             seq = np.vstack([seq, padding])
         
-        return torch.FloatTensor(seq), torch.LongTensor([label])[0]
+        return torch.FloatTensor(seq), torch.LongTensor([label])[0], torch.LongTensor([duration])[0]
     
     def _apply_temporal_augmentation(self, seq):
         """
@@ -219,18 +222,19 @@ def create_balanced_sampler(labels):
 # ENTRENAMIENTO
 # =============================================
 def train_epoch(model, loader, criterion, optimizer, device):
-    """Entrena una época."""
+    """Entrena una época con duration embedding."""
     model.train()
     total_loss = 0
     correct = 0
     total = 0
     
-    for sequences, labels in loader:
+    for sequences, labels, durations in loader:
         sequences = sequences.to(device)
         labels = labels.to(device)
+        durations = durations.to(device)
         
         optimizer.zero_grad()
-        outputs = model(sequences)
+        outputs = model(sequences, duration=durations)
         loss = criterion(outputs, labels)
         loss.backward()
         
@@ -246,18 +250,19 @@ def train_epoch(model, loader, criterion, optimizer, device):
 
 
 def evaluate(model, loader, criterion, device):
-    """Evalúa el modelo."""
+    """Evalúa el modelo con duration embedding."""
     model.eval()
     total_loss = 0
     all_preds = []
     all_labels = []
     
     with torch.no_grad():
-        for sequences, labels in loader:
+        for sequences, labels, durations in loader:
             sequences = sequences.to(device)
             labels = labels.to(device)
+            durations = durations.to(device)
             
-            outputs = model(sequences)
+            outputs = model(sequences, duration=durations)
             loss = criterion(outputs, labels)
             
             total_loss += loss.item()

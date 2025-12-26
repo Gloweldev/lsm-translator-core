@@ -2,21 +2,28 @@
 Demo de Inferencia en Tiempo Real con iPad/DroidCam.
 
 Pipeline completo: RTMPose → Transformer → FSM → Predicción + Gráfica Temporal
-Fuente de video: Cámara IP (DroidCam, EpocCam, etc.)
+Fuente de video: Cámara IP (DroidCam, EpocCam, etc.) o video local
 
 Uso:
+    # Cámara en vivo
     python -m src.inference.ipad_demo
+    
+    # Video grabado (para evaluación)
+    python -m src.inference.ipad_demo -v "ruta/video.mp4"
+    python -m src.inference.ipad_demo -v "ruta/video.mp4" --debug
 
 Controles:
     [Q] - Salir
     [R] - Reset buffer
     [S] - Screenshot
     [C] - Clear historial
+    [D] - Toggle diagnóstico
 """
 
 import cv2
 import sys
 import time
+import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -77,11 +84,65 @@ LEFT_WRIST_IDX = 9
 RIGHT_WRIST_IDX = 10
 LEFT_HIP_IDX = 11
 RIGHT_HIP_IDX = 12
-POSE_MARGIN = 0.08  # Margen de seguridad (8% de altura) para señas bajas
+# ACTIVO si muñeca está ARRIBA de (hip - margen)
+# Margen negativo = debe estar claramente ARRIBA de la cadera
+POSE_MARGIN = -0.03  # Negativo = manos deben estar 3% ARRIBA de cadera para ser activo
 
 # Historial
 MAX_HISTORY = 5
 MAX_GRAPH_POINTS = 150  # Puntos max en la gráfica
+
+# =============================================
+# BUFFER INTELIGENTE POR GESTOS
+# =============================================
+class GestureState(Enum):
+    """Estados del buffer inteligente."""
+    IDLE = "idle"           # Esperando que manos suban
+    CAPTURING = "capturing" # Capturando gesto (manos activas)
+    COOLDOWN = "cooldown"   # Mostrando resultado, esperando
+
+RESULT_DISPLAY_TIME = 1.5  # Segundos que se muestra el resultado
+MIN_CAPTURE_FRAMES = 15    # Mínimo de frames para considerar un gesto válido
+
+# Normalización adaptativa de longitud
+TARGET_SEQ_LEN = 60        # Longitud objetivo para normalización
+MIN_FRAMES_FOR_STRETCH = 30  # Si < 30 frames, estirar a TARGET
+MAX_FRAMES_BEFORE_SUBSAMPLE = 120  # Si > 120 frames, submuestrear
+
+
+def normalize_sequence_length(sequence: np.ndarray, target_len: int = TARGET_SEQ_LEN) -> np.ndarray:
+    """
+    Normaliza la longitud de la secuencia para manejar señas rápidas y lentas.
+    
+    - Señas cortas (< 30 frames): Interpola para estirar a target_len
+    - Señas normales (30-120 frames): Sin cambio
+    - Señas largas (> 120 frames): Submuestrea uniformemente a target_len
+    
+    Args:
+        sequence: Array de shape (N, 266) con los keypoints
+        target_len: Longitud objetivo para normalización
+        
+    Returns:
+        Secuencia normalizada
+    """
+    current_len = len(sequence)
+    
+    if current_len < MIN_FRAMES_FOR_STRETCH:
+        # Señas muy rápidas - ESTIRAR (interpolar)
+        # Crear más frames duplicando/interpolando
+        indices = np.linspace(0, current_len - 1, target_len)
+        indices = np.clip(np.round(indices).astype(int), 0, current_len - 1)
+        return sequence[indices]
+    
+    elif current_len > MAX_FRAMES_BEFORE_SUBSAMPLE:
+        # Señas muy largas - COMPRIMIR (submuestrear uniformemente)
+        indices = np.linspace(0, current_len - 1, target_len)
+        indices = np.clip(np.round(indices).astype(int), 0, current_len - 1)
+        return sequence[indices]
+    
+    else:
+        # Longitud normal - sin cambio
+        return sequence
 
 # Colores para gráfica
 COLORS = {
@@ -111,7 +172,7 @@ HAND_CONNECTIONS = [
 # =============================================
 # VETO FÍSICO - Detección de Posición de Descanso
 # =============================================
-def is_pose_active(raw_keypoints: np.ndarray, frame_height: int) -> bool:
+def is_pose_active(raw_keypoints: np.ndarray, frame_height: int, debug: bool = False) -> bool:
     """
     Determina si el usuario está en posición activa para señas.
     
@@ -121,6 +182,7 @@ def is_pose_active(raw_keypoints: np.ndarray, frame_height: int) -> bool:
     Args:
         raw_keypoints: Vector de 266 dims (133 keypoints x 2)
         frame_height: Altura del frame para calcular margen
+        debug: Si True, imprime valores de detección
     
     Returns:
         True si está activo (al menos una mano arriba), False si en descanso
@@ -131,9 +193,17 @@ def is_pose_active(raw_keypoints: np.ndarray, frame_height: int) -> bool:
     left_hip_y = raw_keypoints[LEFT_HIP_IDX * 2 + 1]
     right_hip_y = raw_keypoints[RIGHT_HIP_IDX * 2 + 1]
     
-    # Si no hay detección de keypoints, asumir activo
+    # Si no hay detección de caderas, asumir INACTIVO (más seguro)
     if left_hip_y == 0 and right_hip_y == 0:
-        return True
+        if debug:
+            print(f"[DEBUG] Sin detección de caderas → INACTIVO")
+        return False
+    
+    # Si no hay detección de muñecas, asumir INACTIVO
+    if left_wrist_y == 0 and right_wrist_y == 0:
+        if debug:
+            print(f"[DEBUG] Sin detección de muñecas → INACTIVO")
+        return False
     
     # Calcular margen de seguridad (permite señas a la altura del ombligo)
     margin = frame_height * POSE_MARGIN
@@ -143,20 +213,24 @@ def is_pose_active(raw_keypoints: np.ndarray, frame_height: int) -> bool:
                right_hip_y if right_hip_y > 0 else 9999)
     
     if hip_y == 9999:
-        return True  # No hay referencia de cadera
+        if debug:
+            print(f"[DEBUG] Sin referencia de cadera válida → INACTIVO")
+        return False
     
     # Umbral: cadera + margen (más abajo que la cadera)
     threshold_y = hip_y + margin
     
     # Verificar si AMBAS muñecas están por debajo del umbral
-    # (Si una está a 0, significa no detectada - ignorar)
     left_below = (left_wrist_y > threshold_y) if left_wrist_y > 0 else True
     right_below = (right_wrist_y > threshold_y) if right_wrist_y > 0 else True
     
-    # Inactivo solo si AMBAS manos están abajo Y al menos una fue detectada
-    both_detected = left_wrist_y > 0 or right_wrist_y > 0
+    result = not (left_below and right_below)
     
-    if left_below and right_below and both_detected:
+    if debug:
+        print(f"[DEBUG] wrist_L:{left_wrist_y:.0f} wrist_R:{right_wrist_y:.0f} | hip:{hip_y:.0f} thresh:{threshold_y:.0f} | ACTIVO:{result}")
+    
+    # Inactivo si AMBAS manos están abajo
+    if left_below and right_below:
         return False  # Posición de descanso
     
     return True  # Al menos una mano activa
@@ -351,15 +425,17 @@ class LSMInference:
             return None, 0.0, None
         
         sequence = np.array(list(self.buffer))
+        actual_frames = len(sequence)  # Duración real antes del padding
         
         if len(sequence) < BUFFER_SIZE:
             padding = np.zeros((BUFFER_SIZE - len(sequence), INPUT_DIM))
             sequence = np.vstack([sequence, padding])
         
         tensor = torch.FloatTensor(sequence).unsqueeze(0).to(self.device)
+        duration = torch.LongTensor([actual_frames]).to(self.device)
         
         with torch.no_grad():
-            logits = self.model(tensor)
+            logits = self.model(tensor, duration=duration)
             probs = F.softmax(logits, dim=1)
             confidence, predicted = probs.max(1)
         
@@ -390,9 +466,10 @@ class LSMInference:
             sequence = np.vstack([sequence, padding])
         
         tensor = torch.FloatTensor(sequence).unsqueeze(0).to(self.device)
+        duration = torch.LongTensor([actual_frames]).to(self.device)
         
         with torch.no_grad():
-            analysis = self.model.forward_with_analysis(tensor)
+            analysis = self.model.forward_with_analysis(tensor, duration=duration)
             logits = analysis['logits']
             probs = F.softmax(logits, dim=1)
             confidence, predicted = probs.max(1)
@@ -591,8 +668,14 @@ def draw_diagnostic_panel(frame, analysis: dict, w: int, h: int) -> np.ndarray:
     return frame
 
 
-def run_demo():
-    """Ejecuta el demo con gráfica temporal en tiempo real."""
+def run_demo(video_path: str = None, debug: bool = False):
+    """
+    Ejecuta el demo con gráfica temporal en tiempo real.
+    
+    Args:
+        video_path: Ruta opcional a video grabado (para evaluación offline)
+        debug: Si True, imprime valores de detección de pose
+    """
     print("=" * 60)
     print("🤟 LSM-Core: Demo con Gráfica Temporal")
     print("=" * 60)
@@ -603,7 +686,11 @@ def run_demo():
         print(f"❌ Error inicializando: {e}")
         return
     
-    if USE_WEBCAM:
+    # Determinar fuente de video
+    if video_path:
+        source = video_path
+        print(f"🎬 Usando video: {video_path}")
+    elif USE_WEBCAM:
         source = WEBCAM_ID
         print(f"📷 Usando webcam {WEBCAM_ID}")
     else:
@@ -623,6 +710,16 @@ def run_demo():
     fps_counter = deque(maxlen=30)
     frame_count = 0
     diagnostic_mode = True  # Inicia con diagnóstico activo (toggle con D)
+    
+    # =============================================
+    # BUFFER INTELIGENTE POR GESTOS
+    # =============================================
+    gesture_state = GestureState.IDLE
+    gesture_buffer = []  # Buffer temporal para un gesto completo
+    last_prediction = None  # Último resultado
+    last_confidence = 0.0
+    last_analysis = None
+    cooldown_start = 0  # Tiempo cuando empezó el cooldown
     
     # Dimensiones objetivo (video vertical)
     TARGET_HEIGHT = 720
@@ -655,68 +752,129 @@ def run_demo():
         # Extraer keypoints
         raw_keypoints, normalized_keypoints = inference.extract_keypoints(frame)
         
-        # =============================================
-        # VETO FÍSICO - Verificar posición de manos
-        # =============================================
-        pose_active = is_pose_active(raw_keypoints, h)
+        # Verificar si manos están activas
+        pose_active = is_pose_active(raw_keypoints, h, debug=debug)
         
-        # =============================================
-        # NORMALIZACIÓN DE FPS - Duplicar frames si FPS < 30
-        # Esto compensa que el modelo fue entrenado a ~30 FPS
-        # =============================================
+        # FPS
         fps_counter.append(1.0 / (time.time() - start_time + 1e-6))
         current_fps = np.mean(list(fps_counter)[-FPS_SMOOTHING:])
-        
-        # Calcular cuántas veces duplicar el frame
         duplicate_factor = max(1, round(TRAINING_FPS / max(current_fps, 1)))
         
-        if pose_active:
-            # Posición activa - ejecutar inferencia normal
-            # Duplicar frame para compensar FPS bajo
-            for _ in range(duplicate_factor):
-                inference.buffer.append(normalized_keypoints)
+        # =============================================
+        # MÁQUINA DE ESTADOS DEL BUFFER INTELIGENTE
+        # =============================================
+        
+        if gesture_state == GestureState.IDLE:
+            # Esperando que manos suban
+            if pose_active:
+                # Transición: IDLE → CAPTURING
+                gesture_state = GestureState.CAPTURING
+                gesture_buffer = []
+                # Agregar primer frame
+                for _ in range(duplicate_factor):
+                    gesture_buffer.append(normalized_keypoints)
+                # print("📹 Iniciando captura de gesto")
             
-            # Dibujar esqueleto (verde)
+            # Dibujar esqueleto gris (inactivo)
             frame = inference.draw_skeleton(frame, raw_keypoints)
             
-            # Predecir (con o sin análisis)
-            if diagnostic_mode:
-                analysis = inference.predict_with_analysis()
-                if analysis:
-                    prediction = analysis['prediction']
-                    confidence = analysis['confidence']
-                    probs = analysis['all_probs']
-                else:
-                    prediction, confidence, probs = None, 0.0, None
-                    analysis = None
+        elif gesture_state == GestureState.CAPTURING:
+            # Capturando gesto
+            if pose_active:
+                # Seguir capturando
+                for _ in range(duplicate_factor):
+                    gesture_buffer.append(normalized_keypoints)
+                # Dibujar esqueleto verde (capturando)
+                frame = inference.draw_skeleton(frame, raw_keypoints)
             else:
-                prediction, confidence, probs = inference.predict()
-                analysis = None
+                # Transición: CAPTURING → COOLDOWN (manos bajaron)
+                # Hacer predicción con el gesto completo
+                if len(gesture_buffer) >= MIN_CAPTURE_FRAMES:
+                    # Preparar secuencia con normalización adaptativa
+                    raw_sequence = np.array(gesture_buffer)
+                    
+                    # Normalizar longitud (estirar si muy corto, comprimir si muy largo)
+                    sequence = normalize_sequence_length(raw_sequence)
+                    actual_frames = len(sequence)
+                    
+                    # Truncar o hacer padding a BUFFER_SIZE
+                    if len(sequence) > BUFFER_SIZE:
+                        sequence = sequence[-BUFFER_SIZE:]  # Tomar últimos
+                        actual_frames = BUFFER_SIZE
+                    elif len(sequence) < BUFFER_SIZE:
+                        padding = np.zeros((BUFFER_SIZE - len(sequence), INPUT_DIM))
+                        sequence = np.vstack([sequence, padding])
+                    
+                    tensor = torch.FloatTensor(sequence).unsqueeze(0).to(inference.device)
+                    duration = torch.LongTensor([actual_frames]).to(inference.device)
+                    
+                    with torch.no_grad():
+                        if diagnostic_mode:
+                            analysis = inference.model.forward_with_analysis(tensor, duration=duration)
+                            logits = analysis['logits']
+                            probs = F.softmax(logits, dim=1)
+                            confidence, predicted = probs.max(1)
+                            
+                            probs_np = probs[0].cpu().numpy()
+                            sorted_indices = np.argsort(probs_np)[::-1]
+                            ranked_classes = [(CLASS_NAMES[i], probs_np[i]) for i in sorted_indices]
+                            frame_importance = analysis['frame_importance'][:actual_frames]
+                            
+                            last_analysis = {
+                                'prediction': CLASS_NAMES[predicted.item()],
+                                'confidence': confidence.item(),
+                                'ranked_classes': ranked_classes,
+                                'actual_frames': actual_frames,
+                                'peak_frame': np.argmax(frame_importance),
+                                'region_importance': analysis['region_importance']
+                            }
+                        else:
+                            logits = inference.model(tensor, duration=duration)
+                            probs = F.softmax(logits, dim=1)
+                            confidence, predicted = probs.max(1)
+                            last_analysis = None
+                        
+                        last_prediction = CLASS_NAMES[predicted.item()]
+                        last_confidence = confidence.item()
+                    
+                    # Actualizar FSM para historial
+                    inference.fsm.update(last_prediction, last_confidence)
+                    
+                    # print(f"✅ Gesto detectado: {last_prediction} ({last_confidence:.0%})")
+                else:
+                    # Gesto muy corto, ignorar
+                    last_prediction = None
+                    last_confidence = 0.0
+                    last_analysis = None
+                
+                gesture_state = GestureState.COOLDOWN
+                cooldown_start = time.time()
+                gesture_buffer = []
+                
+                # Dibujar esqueleto gris
+                frame = inference.draw_skeleton(frame, raw_keypoints)
+        
+        elif gesture_state == GestureState.COOLDOWN:
+            # Mostrando resultado
+            time_in_cooldown = time.time() - cooldown_start
             
-            # Actualizar FSM
-            inference.fsm.update(prediction, confidence)
-            current_word = inference.fsm.get_current_word()
-            veto_active = False
-        else:
-            # Posición de descanso - VETO ACTIVO
-            # CRÍTICO: Limpiar buffer para matar memoria de seña anterior
-            if len(inference.buffer) > 0:
-                inference.buffer.clear()
-                inference.fsm.state = State.IDLE
-                inference.fsm.last_word = None
-                # Limpiar historial de probabilidades
-                for cls in CLASS_NAMES:
-                    inference.prob_history[cls].clear()
-            
-            # Dibujar esqueleto en gris (indicar veto)
-            frame = inference.draw_skeleton(frame, raw_keypoints)
-            
-            prediction = "nada"
-            confidence = 0.0
-            probs = None
-            current_word = None
-            veto_active = True
-            analysis = None  # No hay análisis en veto
+            if pose_active:
+                # Usuario quiere hacer otro gesto, salir de cooldown
+                gesture_state = GestureState.CAPTURING
+                gesture_buffer = []
+                for _ in range(duplicate_factor):
+                    gesture_buffer.append(normalized_keypoints)
+                frame = inference.draw_skeleton(frame, raw_keypoints)
+            elif time_in_cooldown > RESULT_DISPLAY_TIME:
+                # Timeout, volver a IDLE
+                gesture_state = GestureState.IDLE
+                frame = inference.draw_skeleton(frame, raw_keypoints)
+            else:
+                # Seguir mostrando resultado
+                frame = inference.draw_skeleton(frame, raw_keypoints)
+        
+        # Variables para UI
+        current_word = inference.fsm.get_current_word()
         
         # =============================================
         # UI sobre el video
@@ -725,29 +883,30 @@ def run_demo():
         # Header
         cv2.rectangle(frame, (0, 0), (w, 100), (0, 0, 0), -1)
         
-        # Estado FSM + Veto
-        if veto_active:
-            cv2.putText(frame, "VETO", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            cv2.putText(frame, "(manos abajo)", (10, 55),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
-        else:
-            state_color = (0, 255, 0) if inference.fsm.state == State.ACTIVE else (150, 150, 150)
-            cv2.putText(frame, f"{inference.fsm.state.value}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, state_color, 2)
+        # Estado del buffer inteligente
+        if gesture_state == GestureState.IDLE:
+            cv2.putText(frame, "ESPERANDO", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (150, 150, 150), 2)
+            cv2.putText(frame, "(levanta manos)", (10, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+        elif gesture_state == GestureState.CAPTURING:
+            cv2.putText(frame, "CAPTURANDO", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(frame, f"frames: {len(gesture_buffer)}", (10, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 200), 1)
+        elif gesture_state == GestureState.COOLDOWN:
+            cv2.putText(frame, "RESULTADO", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         
-        # Palabra actual
-        if current_word:
+        # Mostrar última predicción
+        if last_prediction and last_prediction != "nada":
+            cv2.putText(frame, last_prediction.upper(), (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+            cv2.putText(frame, f"{last_confidence:.0%}", (w - 80, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        elif current_word:
             cv2.putText(frame, current_word.upper(), (10, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
-        elif prediction and prediction != "nada" and not veto_active:
-            cv2.putText(frame, f"({prediction})", (10, 90),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (100, 100, 100), 2)
-        
-        # Confianza
-        if prediction and not veto_active:
-            cv2.putText(frame, f"{confidence:.0%}", (w - 80, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         
         # Historial (parte inferior)
         history = inference.fsm.get_history()
@@ -758,20 +917,20 @@ def run_demo():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         # FPS y Factor de duplicación
-        fps = current_fps  # Ya calculado arriba
+        fps = current_fps
         cv2.putText(frame, f"FPS:{fps:.0f} x{duplicate_factor}", (w - 120, h - 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
         
         # =============================================
         # Panel de diagnóstico (si está activo)
         # =============================================
-        if diagnostic_mode and analysis:
-            frame = draw_diagnostic_panel(frame, analysis, w, h)
+        if diagnostic_mode and last_analysis:
+            frame = draw_diagnostic_panel(frame, last_analysis, w, h)
         
         # =============================================
         # Crear gráfica temporal
         # =============================================
-        target_class = current_word if current_word else (prediction if prediction else "nada")
+        target_class = current_word if current_word else (last_prediction if last_prediction else "nada")
         graph_img = inference.create_graph_image(target_class, GRAPH_WIDTH, TARGET_HEIGHT)
         
         # =============================================
@@ -808,4 +967,9 @@ def run_demo():
 
 
 if __name__ == "__main__":
-    run_demo()
+    parser = argparse.ArgumentParser(description="LSM-Core: Demo de Inferencia")
+    parser.add_argument("-v", "--video", type=str, help="Ruta a video para evaluación offline")
+    parser.add_argument("--debug", action="store_true", help="Mostrar valores de detección de pose")
+    args = parser.parse_args()
+    
+    run_demo(video_path=args.video, debug=args.debug)

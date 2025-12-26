@@ -106,6 +106,40 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class DurationEmbedding(nn.Module):
+    """
+    Embedding para codificar la duración de la secuencia.
+    
+    Permite al modelo adaptarse a señas realizadas a diferentes velocidades
+    (rápidas vs lentas) al darle información explícita sobre la duración.
+    """
+    
+    def __init__(self, d_model: int, max_duration: int = MAX_SEQ_LEN):
+        super().__init__()
+        self.max_duration = max_duration
+        
+        # MLP para proyectar duración normalizada a d_model dims
+        self.embedding = nn.Sequential(
+            nn.Linear(1, d_model // 4),
+            nn.GELU(),
+            nn.Linear(d_model // 4, d_model),
+            nn.LayerNorm(d_model)
+        )
+    
+    def forward(self, duration: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            duration: [Batch] - Número de frames reales (antes del padding)
+            
+        Returns:
+            [Batch, d_model] - Embedding de duración
+        """
+        # Normalizar duración a [0, 1]
+        norm_duration = duration.float() / self.max_duration
+        norm_duration = norm_duration.unsqueeze(-1)  # [Batch, 1]
+        return self.embedding(norm_duration)  # [Batch, d_model]
+
+
 class LSMTransformer(nn.Module):
     """
     Transformer Encoder para clasificación de secuencias de landmarks LSM.
@@ -114,9 +148,10 @@ class LSMTransformer(nn.Module):
         1. Feature-Weighted Embedding: landmarks (266) -> d_model (128)
            - Pesos por feature: manos × 2.5, cara × 0.1
         2. Positional Encoding: agrega información temporal
-        3. Transformer Encoder: procesa la secuencia
-        4. Global Average Pooling: resume la secuencia
-        5. Classification Head: produce logits para cada clase
+        3. Duration Embedding: codifica duración de secuencia (NUEVO)
+        4. Transformer Encoder: procesa la secuencia
+        5. Global Average Pooling: resume la secuencia
+        6. Classification Head: produce logits para cada clase
     """
     
     def __init__(
@@ -133,6 +168,7 @@ class LSMTransformer(nn.Module):
         
         self.d_model = d_model
         self.input_dim = input_dim
+        self.max_seq_len = max_seq_len
         
         # 1. Feature-Weighted Embedding
         self.input_embedding = FeatureWeightedEmbedding(input_dim, d_model, dropout)
@@ -140,7 +176,10 @@ class LSMTransformer(nn.Module):
         # 2. Positional Encoding con dropout
         self.pos_encoder = PositionalEncoding(d_model, max_seq_len, dropout)
         
-        # 3. Transformer Encoder con pre-LN (más estable)
+        # 3. Duration Embedding (NUEVO)
+        self.duration_embedding = DurationEmbedding(d_model, max_seq_len)
+        
+        # 4. Transformer Encoder con pre-LN (más estable)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -156,7 +195,7 @@ class LSMTransformer(nn.Module):
             norm=nn.LayerNorm(d_model)  # Final LayerNorm
         )
         
-        # 4. Classification Head con regularización
+        # 5. Classification Head con regularización
         self.classifier = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Dropout(dropout * 1.5),  # Mayor dropout antes del clasificador
@@ -166,12 +205,13 @@ class LSMTransformer(nn.Module):
             nn.Linear(d_model // 2, num_classes)
         )
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, duration: torch.Tensor = None) -> torch.Tensor:
         """
         Forward pass.
         
         Args:
             x: [Batch, Seq_Len, Input_Dim] - Secuencia de landmarks
+            duration: [Batch] - Duración real (frames antes de padding). Opcional.
             
         Returns:
             [Batch, Num_Classes] - Logits de clasificación
@@ -181,6 +221,12 @@ class LSMTransformer(nn.Module):
         
         # Positional Encoding
         x = self.pos_encoder(x)
+        
+        # Duration Embedding (si se proporciona)
+        if duration is not None:
+            dur_emb = self.duration_embedding(duration)  # [Batch, d_model]
+            dur_emb = dur_emb.unsqueeze(1)  # [Batch, 1, d_model]
+            x = x + dur_emb  # Broadcast: suma a todos los frames
         
         # Transformer Encoder
         x = self.transformer_encoder(x)
@@ -193,7 +239,7 @@ class LSMTransformer(nn.Module):
         
         return x
     
-    def forward_with_analysis(self, x: torch.Tensor) -> dict:
+    def forward_with_analysis(self, x: torch.Tensor, duration: torch.Tensor = None) -> dict:
         """
         Forward pass con análisis de interpretabilidad.
         
@@ -203,6 +249,7 @@ class LSMTransformer(nn.Module):
         
         Args:
             x: [Batch, Seq_Len, Input_Dim] - Secuencia de landmarks
+            duration: [Batch] - Duración real (frames antes de padding). Opcional.
             
         Returns:
             dict con 'logits', 'frame_importance', 'feature_weights', 'region_importance'
@@ -221,7 +268,13 @@ class LSMTransformer(nn.Module):
         # 2. Positional Encoding
         x = self.pos_encoder(x_embedded)
         
-        # 3. Transformer Encoder
+        # 3. Duration Embedding (si se proporciona)
+        if duration is not None:
+            dur_emb = self.duration_embedding(duration)
+            dur_emb = dur_emb.unsqueeze(1)
+            x = x + dur_emb
+        
+        # 4. Transformer Encoder
         x = self.transformer_encoder(x)
         
         # Calcular importancia temporal (qué frames contribuyeron más)

@@ -219,6 +219,7 @@ class VideoValidator:
             return None, 0.0
         
         sequence = np.array(list(self.buffer))
+        actual_frames = len(sequence)  # Duración real antes del padding
         
         # Padding
         if len(sequence) < BUFFER_SIZE:
@@ -226,9 +227,10 @@ class VideoValidator:
             sequence = np.vstack([sequence, padding])
         
         tensor = torch.FloatTensor(sequence).unsqueeze(0).to(self.device)
+        duration = torch.LongTensor([actual_frames]).to(self.device)
         
         with torch.no_grad():
-            logits = self.model(tensor)
+            logits = self.model(tensor, duration=duration)
             probs = F.softmax(logits, dim=1)
             confidence, predicted = probs.max(1)
         

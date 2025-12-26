@@ -174,6 +174,7 @@ class TemporalAnalyzer:
     def predict_with_buffer(self) -> np.ndarray:
         """Predice usando buffer actual con padding si es necesario."""
         sequence = np.array(list(self.buffer))
+        actual_frames = len(sequence)  # Duración real antes del padding
         
         # Padding al inicio si buffer incompleto (Cold Start)
         if len(sequence) < BUFFER_SIZE:
@@ -181,9 +182,10 @@ class TemporalAnalyzer:
             sequence = np.vstack([padding, sequence])
         
         tensor = torch.FloatTensor(sequence).unsqueeze(0).to(self.device)
+        duration = torch.LongTensor([actual_frames]).to(self.device)
         
         with torch.no_grad():
-            logits = self.model(tensor)
+            logits = self.model(tensor, duration=duration)
             probs = F.softmax(logits, dim=1)
         
         return probs[0].cpu().numpy()

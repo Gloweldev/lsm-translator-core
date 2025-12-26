@@ -26,6 +26,9 @@ MODELS_DIR = PROJECT_ROOT / "models"
 # -----------------------------------------------------------
 # CONFIGURACIÓN RTMPose-WholeBody
 # -----------------------------------------------------------
+# Opciones disponibles en mmpose:
+# - rtmpose-m (rápido, ~35 FPS)
+# - rtmpose-l (balanceado, ~25 FPS) ← Recomendado
 RTMPOSE_MODEL = 'rtmpose-l_8xb32-270e_coco-wholebody-384x288'
 RTMPOSE_INPUT_SIZE = (384, 288)
 

@@ -179,15 +179,17 @@ class LiveTemporalDemo:
             return None, np.zeros(len(CLASS_NAMES))
         
         sequence = np.array(list(self.buffer))
+        actual_frames = len(sequence)  # Duración real antes del padding
         
         if len(sequence) < BUFFER_SIZE:
             padding = np.zeros((BUFFER_SIZE - len(sequence), INPUT_DIM))
             sequence = np.vstack([padding, sequence])
         
         tensor = torch.FloatTensor(sequence).unsqueeze(0).to(self.device)
+        duration = torch.LongTensor([actual_frames]).to(self.device)
         
         with torch.no_grad():
-            logits = self.model(tensor)
+            logits = self.model(tensor, duration=duration)
             probs = F.softmax(logits, dim=1)
         
         probs_np = probs[0].cpu().numpy()
