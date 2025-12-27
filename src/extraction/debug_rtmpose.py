@@ -102,43 +102,203 @@ class KeypointSmoother:
         return smoothed
 
 
+def is_hand_valid(hand_points: dict, hand_scores: dict, 
+                   w: int, h: int,
+                   all_keypoints: np.ndarray = None,
+                   all_scores: np.ndarray = None,
+                   wrist_idx: int = None,
+                   max_spread: float = 150,
+                   min_confidence: float = 0.8,
+                   edge_margin: float = 30,
+                   high_confidence: float = 0.9,
+                   max_wrist_distance: float = 100) -> tuple:
+    """
+    Valida si una mano es confiable para usar.
+    
+    Checks:
+    1. Coherencia espacial (puntos agrupados)
+    2. Confianza mínima
+    3. Proximidad a la muñeca (mano debe estar cerca de su muñeca)
+    4. Manejo inteligente de bordes
+    
+    Args:
+        hand_points: dict {idx: (x, y)} de puntos de la mano
+        hand_scores: dict {idx: score} de confianzas
+        w, h: dimensiones del frame
+        all_keypoints: array completo de keypoints (para verificar muñeca)
+        all_scores: array completo de scores
+        wrist_idx: índice de la muñeca correspondiente (9=izq, 10=der)
+        max_spread: distancia máxima entre puntos de la mano
+        min_confidence: confianza promedio mínima
+        edge_margin: margen de borde
+        high_confidence: umbral para aceptar en borde
+        max_wrist_distance: distancia máxima del centro de mano a la muñeca
+        
+    Returns:
+        (is_valid, reason)
+    """
+    if len(hand_points) < 5:
+        return False, "pocos"
+    
+    points = list(hand_points.values())
+    scores = list(hand_scores.values())
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    
+    # Check 1: Coherencia espacial
+    spread_x = max(xs) - min(xs)
+    spread_y = max(ys) - min(ys)
+    
+    if spread_x > max_spread or spread_y > max_spread:
+        return False, "dispersa"
+    
+    # Check 2: Confianza promedio
+    avg_conf = sum(scores) / len(scores)
+    if avg_conf < min_confidence:
+        return False, f"conf({avg_conf:.2f})"
+    
+    # Check 3: Proximidad a la muñeca
+    if all_keypoints is not None and all_scores is not None and wrist_idx is not None:
+        wrist = all_keypoints[wrist_idx]
+        wrist_conf = all_scores[wrist_idx]
+        
+        # Si la muñeca es visible, la mano debe estar cerca
+        if wrist_conf >= 0.5 and wrist[0] > 0 and wrist[1] > 0:
+            hand_center_x = sum(xs) / len(xs)
+            hand_center_y = sum(ys) / len(ys)
+            
+            distance = ((hand_center_x - wrist[0])**2 + (hand_center_y - wrist[1])**2)**0.5
+            
+            if distance > max_wrist_distance:
+                return False, f"lejos({distance:.0f}px)"
+        else:
+            # Muñeca no visible → mano probablemente oculta
+            # Solo aceptar si tiene muy alta confianza
+            if avg_conf < high_confidence:
+                return False, "sin_muñeca"
+    
+    # Check 4: Manejo de bordes inteligente
+    near_edge = 0
+    for x, y in points:
+        if x < edge_margin or x > (w - edge_margin) or y < edge_margin or y > (h - edge_margin):
+            near_edge += 1
+    
+    edge_ratio = near_edge / len(points)
+    
+    if edge_ratio > 0.5:
+        if avg_conf >= high_confidence:
+            return True, "borde_ok"
+        else:
+            return False, f"borde({avg_conf:.2f})"
+    
+    return True, "ok"
+
+
+# Mantener compatibilidad con nombre anterior
+def is_hand_coherent(hand_points: dict, max_spread: float = 150) -> bool:
+    """Wrapper de compatibilidad para is_hand_valid."""
+    if len(hand_points) < 5:
+        return False
+    
+    points = list(hand_points.values())
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    
+    spread_x = max(xs) - min(xs)
+    spread_y = max(ys) - min(ys)
+    
+    return spread_x < max_spread and spread_y < max_spread
+
+
 def draw_keypoints(frame, keypoints, scores, threshold, h, w):
-    """Dibuja keypoints. RTMPose devuelve coordenadas en píxeles."""
+    """Dibuja keypoints. Ignora piernas/pies, oculta filtrados y valida coherencia de manos."""
     drawn = {}
     
+    # Índices a ignorar (piernas y pies)
+    SKIP_INDICES = {13, 14, 15, 16, 17, 18, 19, 20, 21, 22}
+    
+    # Primero, validar manos con todos los checks
+    left_hand_indices = set(range(91, 112))
+    right_hand_indices = set(range(112, 133))
+    
+    # Recopilar puntos y scores de manos para validación
+    left_hand_pts = {}
+    left_hand_scores = {}
+    right_hand_pts = {}
+    right_hand_scores = {}
+    
+    for i in range(91, 112):
+        if scores[i] >= threshold and keypoints[i][0] > 0 and keypoints[i][1] > 0:
+            px, py = int(keypoints[i][0]), int(keypoints[i][1])
+            if 0 <= px < w and 0 <= py < h:
+                left_hand_pts[i] = (px, py)
+                left_hand_scores[i] = scores[i]
+    
+    for i in range(112, 133):
+        if scores[i] >= threshold and keypoints[i][0] > 0 and keypoints[i][1] > 0:
+            px, py = int(keypoints[i][0]), int(keypoints[i][1])
+            if 0 <= px < w and 0 <= py < h:
+                right_hand_pts[i] = (px, py)
+                right_hand_scores[i] = scores[i]
+    
+    # Validar manos con función mejorada (incluye check de muñeca)
+    # Muñeca izquierda = índice 9, Muñeca derecha = índice 10
+    left_valid, left_reason = is_hand_valid(
+        left_hand_pts, left_hand_scores, w, h,
+        all_keypoints=keypoints, all_scores=scores, wrist_idx=9
+    )
+    right_valid, right_reason = is_hand_valid(
+        right_hand_pts, right_hand_scores, w, h,
+        all_keypoints=keypoints, all_scores=scores, wrist_idx=10
+    )
+    
+    # Indices a ignorar por manos inválidas
+    invalid_indices = set()
+    if not left_valid:
+        invalid_indices.update(left_hand_indices)
+    if not right_valid:
+        invalid_indices.update(right_hand_indices)
+    
     for i, (kp, score) in enumerate(zip(keypoints, scores)):
+        # Ignorar piernas, pies y manos incoherentes
+        if i in SKIP_INDICES or i in invalid_indices:
+            continue
+            
         px, py = int(kp[0]), int(kp[1])
         
         if not (0 <= px < w and 0 <= py < h):
             continue
         
-        # Punto filtrado por threshold
         if score < threshold:
-            cv2.circle(frame, (px, py), 2, COLOR_FILTERED, -1)
             continue
         
-        # Color según confianza
         color = COLOR_HIGH_CONF if score > 0.7 else COLOR_MED_CONF
         cv2.circle(frame, (px, py), 4, color, -1)
         drawn[i] = (px, py)
     
-    # Conexiones del cuerpo
-    for i, j in BODY_CONNECTIONS:
+    # Conexiones del cuerpo (sin piernas)
+    UPPER_BODY_CONNECTIONS = [
+        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+        (5, 11), (6, 12), (11, 12),
+    ]
+    for i, j in UPPER_BODY_CONNECTIONS:
         if i in drawn and j in drawn:
             cv2.line(frame, drawn[i], drawn[j], (100, 255, 100), 1)
     
-    # Conexiones de manos
-    for ci, cj in HAND_CONNECTIONS:
-        # Mano izquierda (91-111)
-        i, j = 91 + ci, 91 + cj
-        if i in drawn and j in drawn:
-            cv2.line(frame, drawn[i], drawn[j], (255, 200, 0), 1)
-        # Mano derecha (112-132)
-        i, j = 112 + ci, 112 + cj
-        if i in drawn and j in drawn:
-            cv2.line(frame, drawn[i], drawn[j], (200, 0, 255), 1)
+    # Conexiones de manos (solo si son coherentes)
+    if left_valid:
+        for ci, cj in HAND_CONNECTIONS:
+            i, j = 91 + ci, 91 + cj
+            if i in drawn and j in drawn:
+                cv2.line(frame, drawn[i], drawn[j], (255, 200, 0), 1)
     
-    return frame
+    if right_valid:
+        for ci, cj in HAND_CONNECTIONS:
+            i, j = 112 + ci, 112 + cj
+            if i in drawn and j in drawn:
+                cv2.line(frame, drawn[i], drawn[j], (200, 0, 255), 1)
+    
+    return frame, (left_valid, left_reason), (right_valid, right_reason)
 
 
 def nothing(x):
@@ -240,8 +400,10 @@ def run_debug():
             frame, keypoints, scores, h, w = cache
             display = frame.copy()
             
-            # Dibujar keypoints
-            display = draw_keypoints(display, keypoints, scores, threshold, h, w)
+            # Dibujar keypoints (ahora retorna estado de manos con razones)
+            display, left_result, right_result = draw_keypoints(display, keypoints, scores, threshold, h, w)
+            left_ok, left_reason = left_result
+            right_ok, right_reason = right_result
             
             # Dibujar centro de caderas (cruz azul)
             left_hip = keypoints[LEFT_HIP_IDX]
@@ -265,6 +427,14 @@ def run_debug():
             visible = np.sum(scores >= threshold)
             cv2.putText(display, f"Visible: {visible}/{KEYPOINTS_PER_FRAME}", (w-120, 45), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
+            
+            # Estado de manos con razones
+            left_status = "ok" if left_ok else left_reason
+            right_status = "ok" if right_ok else right_reason
+            left_color = (255, 200, 0) if left_ok else (0, 0, 255)
+            right_color = (200, 0, 255) if right_ok else (0, 0, 255)
+            cv2.putText(display, f"L:{left_status}", (w-120, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.35, left_color, 1)
+            cv2.putText(display, f"R:{right_status}", (w-120, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.35, right_color, 1)
             
             if paused:
                 cv2.putText(display, "PAUSED", (w//2-50, h//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)

@@ -1,0 +1,37 @@
+# LSM Translator v1.0 Baseline - Requirements
+# Python 3.11.14 | CUDA 12.1
+
+# Core ML (GPU)
+torch==2.1.2+cu121
+torchvision==0.16.2+cu121
+torchaudio==2.1.2+cu121
+
+# Pose Estimation
+mmpose==1.3.2
+mmdet==3.2.0
+mmcv==2.1.0
+mmengine==0.10.7
+
+# Data Science
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.16.3
+scikit-learn==1.8.0
+
+# Computer Vision
+opencv-python==4.11.0.86
+pillow==12.0.0
+
+# Visualization
+matplotlib==3.10.8
+seaborn==0.13.2
+
+# MLOps
+mlflow==3.8.0
+
+# Utils
+tqdm==4.65.2
+pyyaml==6.0.3
+
+# Install with:
+# pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu121 --extra-index-url https://pypi.org/simple

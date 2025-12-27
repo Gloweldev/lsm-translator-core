@@ -153,11 +153,82 @@ COLORS = {
     'nada': '#95a5a6',
 }
 
-# Visualización esqueleto
+# Índices a ignorar (piernas y pies)
+SKIP_INDICES = {13, 14, 15, 16, 17, 18, 19, 20, 21, 22}
+
+
+def is_hand_valid(keypoints: np.ndarray, scores: np.ndarray,
+                  hand_start: int, hand_end: int, wrist_idx: int,
+                  max_spread: float = 150,
+                  min_confidence: float = 0.8,
+                  high_confidence: float = 0.9,
+                  max_wrist_distance: float = 100) -> bool:
+    """
+    Valida si una mano es confiable (no alucinada).
+    
+    Checks:
+    1. Mínimo 5 puntos válidos
+    2. Coherencia espacial
+    3. Confianza promedio
+    4. Proximidad a la muñeca
+    """
+    hand_pts = keypoints[hand_start:hand_end]
+    hand_scores = scores[hand_start:hand_end]
+    
+    valid_mask = np.any(hand_pts != 0, axis=1)
+    valid_pts = hand_pts[valid_mask]
+    valid_scores = hand_scores[valid_mask]
+    
+    if len(valid_pts) < 5:
+        return False
+    
+    # Coherencia espacial
+    spread_x = valid_pts[:, 0].max() - valid_pts[:, 0].min()
+    spread_y = valid_pts[:, 1].max() - valid_pts[:, 1].min()
+    
+    if spread_x > max_spread or spread_y > max_spread:
+        return False
+    
+    # Confianza promedio
+    avg_conf = valid_scores.mean()
+    if avg_conf < min_confidence:
+        return False
+    
+    # Proximidad a muñeca
+    wrist = keypoints[wrist_idx]
+    wrist_conf = scores[wrist_idx]
+    
+    if wrist_conf >= 0.5 and wrist[0] > 0 and wrist[1] > 0:
+        hand_center = valid_pts.mean(axis=0)
+        distance = np.sqrt(((hand_center - wrist) ** 2).sum())
+        if distance > max_wrist_distance:
+            return False
+    else:
+        if avg_conf < high_confidence:
+            return False
+    
+    return True
+
+
+def filter_incoherent_hands(keypoints: np.ndarray, scores: np.ndarray) -> np.ndarray:
+    """Filtra manos incoherentes poniéndolas a cero."""
+    filtered = keypoints.copy()
+    
+    # Mano izquierda: 91-111, muñeca: 9
+    if not is_hand_valid(keypoints.reshape(-1, 2), scores, 91, 112, wrist_idx=9):
+        filtered[91*2:112*2] = 0.0
+    
+    # Mano derecha: 112-132, muñeca: 10
+    if not is_hand_valid(keypoints.reshape(-1, 2), scores, 112, 133, wrist_idx=10):
+        filtered[112*2:133*2] = 0.0
+    
+    return filtered
+
+
+# Visualización esqueleto (sin piernas)
 SKELETON_CONNECTIONS = [
     (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
     (5, 11), (6, 12), (11, 12),
-    (11, 13), (13, 15), (12, 14), (14, 16),
 ]
 
 HAND_CONNECTIONS = [
@@ -176,64 +247,87 @@ def is_pose_active(raw_keypoints: np.ndarray, frame_height: int, debug: bool = F
     """
     Determina si el usuario está en posición activa para señas.
     
-    Retorna False (INACTIVO) si AMBAS muñecas están por debajo de las caderas.
-    Esto indica que el usuario tiene las manos abajo (posición de descanso).
+    Usa posición RELATIVA al cuerpo en lugar de posición absoluta.
+    Compara muñecas con el centro del torso (entre hombros y caderas).
     
     Args:
         raw_keypoints: Vector de 266 dims (133 keypoints x 2)
-        frame_height: Altura del frame para calcular margen
+        frame_height: Altura del frame (para fallback)
         debug: Si True, imprime valores de detección
     
     Returns:
         True si está activo (al menos una mano arriba), False si en descanso
     """
-    # Extraer coordenadas Y (recordar: Y mayor = más abajo en imagen)
+    # Índices para hombros
+    LEFT_SHOULDER_IDX = 5
+    RIGHT_SHOULDER_IDX = 6
+    
+    # Extraer coordenadas Y
     left_wrist_y = raw_keypoints[LEFT_WRIST_IDX * 2 + 1]
     right_wrist_y = raw_keypoints[RIGHT_WRIST_IDX * 2 + 1]
     left_hip_y = raw_keypoints[LEFT_HIP_IDX * 2 + 1]
     right_hip_y = raw_keypoints[RIGHT_HIP_IDX * 2 + 1]
+    left_shoulder_y = raw_keypoints[LEFT_SHOULDER_IDX * 2 + 1]
+    right_shoulder_y = raw_keypoints[RIGHT_SHOULDER_IDX * 2 + 1]
     
-    # Si no hay detección de caderas, asumir INACTIVO (más seguro)
-    if left_hip_y == 0 and right_hip_y == 0:
+    # Calcular centro del torso (entre hombros y caderas)
+    shoulders = []
+    hips = []
+    
+    if left_shoulder_y > 0:
+        shoulders.append(left_shoulder_y)
+    if right_shoulder_y > 0:
+        shoulders.append(right_shoulder_y)
+    if left_hip_y > 0:
+        hips.append(left_hip_y)
+    if right_hip_y > 0:
+        hips.append(right_hip_y)
+    
+    # Necesitamos al menos un hombro y una cadera
+    if not shoulders or not hips:
         if debug:
-            print(f"[DEBUG] Sin detección de caderas → INACTIVO")
+            print(f"[DEBUG] Sin detección de torso → INACTIVO")
         return False
     
-    # Si no hay detección de muñecas, asumir INACTIVO
-    if left_wrist_y == 0 and right_wrist_y == 0:
+    shoulder_y = sum(shoulders) / len(shoulders)
+    hip_y = sum(hips) / len(hips)
+    
+    # Centro del torso (punto medio entre hombros y caderas)
+    torso_center_y = (shoulder_y + hip_y) / 2
+    
+    # Margen: 20% de la altura del torso
+    torso_height = hip_y - shoulder_y
+    margin = torso_height * 0.2
+    
+    # Umbral: un poco abajo del centro del torso
+    threshold_y = torso_center_y + margin
+    
+    # Verificar muñecas
+    wrists_detected = []
+    wrist_positions = []
+    
+    if left_wrist_y > 0:
+        wrists_detected.append('L')
+        wrist_positions.append(left_wrist_y)
+    if right_wrist_y > 0:
+        wrists_detected.append('R')
+        wrist_positions.append(right_wrist_y)
+    
+    # Sin muñecas detectadas = manos ocultas = inactivo
+    if not wrist_positions:
         if debug:
-            print(f"[DEBUG] Sin detección de muñecas → INACTIVO")
+            print(f"[DEBUG] Sin muñecas detectadas → INACTIVO")
         return False
     
-    # Calcular margen de seguridad (permite señas a la altura del ombligo)
-    margin = frame_height * POSE_MARGIN
-    
-    # Usar la cadera más alta detectada como referencia
-    hip_y = min(left_hip_y if left_hip_y > 0 else 9999, 
-               right_hip_y if right_hip_y > 0 else 9999)
-    
-    if hip_y == 9999:
-        if debug:
-            print(f"[DEBUG] Sin referencia de cadera válida → INACTIVO")
-        return False
-    
-    # Umbral: cadera + margen (más abajo que la cadera)
-    threshold_y = hip_y + margin
-    
-    # Verificar si AMBAS muñecas están por debajo del umbral
-    left_below = (left_wrist_y > threshold_y) if left_wrist_y > 0 else True
-    right_below = (right_wrist_y > threshold_y) if right_wrist_y > 0 else True
-    
-    result = not (left_below and right_below)
+    # Calcular cuántas muñecas están ARRIBA del umbral
+    above_count = sum(1 for y in wrist_positions if y < threshold_y)
     
     if debug:
-        print(f"[DEBUG] wrist_L:{left_wrist_y:.0f} wrist_R:{right_wrist_y:.0f} | hip:{hip_y:.0f} thresh:{threshold_y:.0f} | ACTIVO:{result}")
+        wrists_str = '/'.join([f"{w}:{y:.0f}" for w, y in zip(wrists_detected, wrist_positions)])
+        print(f"[DEBUG] muñecas:{wrists_str} | torso_c:{torso_center_y:.0f} thresh:{threshold_y:.0f} | arriba:{above_count}")
     
-    # Inactivo si AMBAS manos están abajo
-    if left_below and right_below:
-        return False  # Posición de descanso
-    
-    return True  # Al menos una mano activa
+    # ACTIVO si al menos una muñeca está ARRIBA del umbral
+    return above_count > 0
 
 
 # =============================================
@@ -395,17 +489,25 @@ class LSMInference:
         results = list(self.pose_inferencer(rgb, return_vis=False))
         
         raw_keypoints = np.zeros(INPUT_DIM)
+        scores = np.zeros(KEYPOINTS_PER_FRAME)
         
         if results and results[0].get('predictions'):
             preds = results[0]['predictions']
             if preds and preds[0]:
                 kp = np.array(preds[0][0].get('keypoints', []))
-                scores = np.array(preds[0][0].get('keypoint_scores', []))
+                sc = np.array(preds[0][0].get('keypoint_scores', []))
                 
                 for i in range(min(len(kp), KEYPOINTS_PER_FRAME)):
-                    if scores[i] >= CONFIDENCE_THRESHOLD:
+                    scores[i] = sc[i]
+                    # Ignorar piernas y pies
+                    if i in SKIP_INDICES:
+                        continue
+                    if sc[i] >= CONFIDENCE_THRESHOLD:
                         raw_keypoints[i*2] = kp[i, 0]
                         raw_keypoints[i*2 + 1] = kp[i, 1]
+        
+        # Filtrar manos incoherentes (alucinaciones)
+        raw_keypoints = filter_incoherent_hands(raw_keypoints, scores)
         
         self.frame_count += 1
         t = self.frame_count / 30.0

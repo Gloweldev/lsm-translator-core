@@ -53,6 +53,63 @@ BUFFER_SIZE = MAX_SEQ_LEN  # 90 frames
 LEFT_HIP_IDX = 11
 RIGHT_HIP_IDX = 12
 
+# Índices a ignorar (piernas y pies)
+SKIP_INDICES = {13, 14, 15, 16, 17, 18, 19, 20, 21, 22}
+
+
+def is_hand_valid(keypoints: np.ndarray, scores: np.ndarray,
+                  hand_start: int, hand_end: int, wrist_idx: int,
+                  max_spread: float = 150,
+                  min_confidence: float = 0.8,
+                  high_confidence: float = 0.9,
+                  max_wrist_distance: float = 100) -> bool:
+    """Valida si una mano es confiable (no alucinada)."""
+    hand_pts = keypoints[hand_start:hand_end]
+    hand_scores = scores[hand_start:hand_end]
+    
+    valid_mask = np.any(hand_pts != 0, axis=1)
+    valid_pts = hand_pts[valid_mask]
+    valid_scores = hand_scores[valid_mask]
+    
+    if len(valid_pts) < 5:
+        return False
+    
+    spread_x = valid_pts[:, 0].max() - valid_pts[:, 0].min()
+    spread_y = valid_pts[:, 1].max() - valid_pts[:, 1].min()
+    
+    if spread_x > max_spread or spread_y > max_spread:
+        return False
+    
+    avg_conf = valid_scores.mean()
+    if avg_conf < min_confidence:
+        return False
+    
+    wrist = keypoints[wrist_idx]
+    wrist_conf = scores[wrist_idx]
+    
+    if wrist_conf >= 0.5 and wrist[0] > 0 and wrist[1] > 0:
+        hand_center = valid_pts.mean(axis=0)
+        distance = np.sqrt(((hand_center - wrist) ** 2).sum())
+        if distance > max_wrist_distance:
+            return False
+    else:
+        if avg_conf < high_confidence:
+            return False
+    
+    return True
+
+
+def filter_incoherent_hands(keypoints: np.ndarray, scores: np.ndarray) -> np.ndarray:
+    """Filtra manos incoherentes poniéndolas a cero."""
+    filtered = keypoints.copy()
+    
+    if not is_hand_valid(keypoints.reshape(-1, 2), scores, 91, 112, wrist_idx=9):
+        filtered[91*2:112*2] = 0.0
+    
+    if not is_hand_valid(keypoints.reshape(-1, 2), scores, 112, 133, wrist_idx=10):
+        filtered[112*2:133*2] = 0.0
+    
+    return filtered
 
 class TemporalAnalyzer:
     """Analiza probabilidades frame por frame."""
@@ -140,17 +197,25 @@ class TemporalAnalyzer:
         results = list(self.pose_inferencer(rgb, return_vis=False))
         
         raw_keypoints = np.zeros(INPUT_DIM)
+        scores = np.zeros(KEYPOINTS_PER_FRAME)
         
         if results and results[0].get('predictions'):
             preds = results[0]['predictions']
             if preds and preds[0]:
                 kp = np.array(preds[0][0].get('keypoints', []))
-                scores = np.array(preds[0][0].get('keypoint_scores', []))
+                sc = np.array(preds[0][0].get('keypoint_scores', []))
                 
                 for i in range(min(len(kp), KEYPOINTS_PER_FRAME)):
-                    if scores[i] >= CONFIDENCE_THRESHOLD:
+                    scores[i] = sc[i]
+                    # Ignorar piernas y pies
+                    if i in SKIP_INDICES:
+                        continue
+                    if sc[i] >= CONFIDENCE_THRESHOLD:
                         raw_keypoints[i*2] = kp[i, 0]
                         raw_keypoints[i*2 + 1] = kp[i, 1]
+        
+        # Filtrar manos incoherentes
+        raw_keypoints = filter_incoherent_hands(raw_keypoints, scores)
         
         # Aplicar smoothing
         self.frame_count += 1

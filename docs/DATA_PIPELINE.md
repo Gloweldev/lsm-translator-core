@@ -79,8 +79,24 @@ python -m src.data.inspect_processed
 
 ## 🧠 4. Entrenamiento
 
+### Entrenar con datos por defecto
 ```bash
 python -m src.training.train
+```
+
+### Ver versiones de datos disponibles
+```bash
+python -m src.training.train --list-versions
+```
+
+### Entrenar con versión específica de datos
+```bash
+python -m src.training.train -d processed_v20241226_125617
+```
+
+### Entrenar con path absoluto
+```bash
+python -m src.training.train -d "C:\path\to\custom\data"
 ```
 
 **Configuración en `src/config/settings.py`:**
@@ -125,14 +141,67 @@ Luego abrir: **http://localhost:5000**
 
 ## 🎥 6. Inferencia
 
-### Validar con videos del dataset
+### Video demo (validar con videos del dataset)
 ```bash
 python -m src.inference.video_demo
 ```
 
-### Demo en tiempo real (iPad/DroidCam)
+### Con video específico
+```bash
+python -m src.inference.video_demo -v "path/to/video.mp4"
+```
+
+### Demo tiempo real (iPad/DroidCam)
 ```bash
 python -m src.inference.ipad_demo
+```
+
+### Con video grabado y modo debug
+```bash
+python -m src.inference.ipad_demo -v "test_video.mp4" --debug
+```
+
+---
+
+## 🔍 7. Debugging y Análisis
+
+> 💡 **Nota**: Todos los scripts usan automáticamente la **última versión** de datos procesados. 
+> Use `-d` solo si necesita una versión específica.
+
+### Debug RTMPose (visualizar keypoints)
+```bash
+python -m src.extraction.debug_rtmpose
+```
+**Controles:** `[Q]` Salir | `[N]` Siguiente | `[ESPACIO]` Pausa | `[F]` Toggle suavizado
+
+### Análisis de confusión del modelo
+```bash
+# Usa última versión automáticamente
+python -m src.analysis.confusion_analysis
+
+# Versión específica
+python -m src.analysis.confusion_analysis -d processed_v20241226_125617
+```
+
+### Análisis temporal (frame por frame)
+```bash
+python -m src.analysis.temporal_analysis
+```
+**Genera:** Gráfica de probabilidades por frame, detecta lag del buffer
+
+### Live temporal demo
+```bash
+python -m src.analysis.live_temporal_demo
+```
+**UI en vivo:** Probabilidades en tiempo real mientras haces señas
+
+### Inspeccionar datos preprocesados
+```bash
+# Usa última versión automáticamente
+python -m src.data.inspect_processed
+
+# Versión específica
+python -m src.data.inspect_processed -d processed_v20241226_125617
 ```
 
 ---

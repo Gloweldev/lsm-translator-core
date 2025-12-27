@@ -26,10 +26,11 @@ MODELS_DIR = PROJECT_ROOT / "models"
 # -----------------------------------------------------------
 # CONFIGURACIÓN RTMPose-WholeBody
 # -----------------------------------------------------------
-# Opciones disponibles en mmpose:
-# - rtmpose-m (rápido, ~35 FPS)
-# - rtmpose-l (balanceado, ~25 FPS) ← Recomendado
-RTMPOSE_MODEL = 'rtmpose-l_8xb32-270e_coco-wholebody-384x288'
+# Opciones disponibles:
+# - rtmpose-l (65 AP) - Original
+# - rtmw-l (70 AP) - Mejor detección de manos (Cocktail14 + InterHand)
+# - rtmw-x (70.2 AP) - Máxima precisión
+RTMPOSE_MODEL = 'rtmw-x_8xb320-270e_cocktail14-384x288'
 RTMPOSE_INPUT_SIZE = (384, 288)
 
 # 133 keypoints: Cuerpo(17) + Pies(6) + Cara(68) + Manos(42)
@@ -64,11 +65,11 @@ CLASS_WEIGHTS = [1.2515, 1.2294, 1.3933, 1.1117, 0.5649]
 # Feature weights por región de keypoints (0-133)
 # Controla importancia de cada parte del cuerpo
 FEATURE_WEIGHTS = {
-    'body': 1.0,      # Cuerpo (indices 0-16)
-    'feet': 0.3,      # Pies (indices 17-22)
-    'face': 0.1,      # Cara (indices 23-90)
-    'left_hand': 2.5, # Mano izquierda (91-111)
-    'right_hand': 2.5 # Mano derecha (112-132)
+    'body': 0.5,      # Cuerpo (indices 0-12) - reducido
+    'feet': 0.0,      # Pies (indices 13-22) - IGNORAR completamente
+    'face': 0.1,      # Cara (indices 23-90) - bajo peso
+    'left_hand': 3.0, # Mano izquierda (91-111) - máximo enfoque
+    'right_hand': 3.0 # Mano derecha (112-132) - máximo enfoque
 }
 
 # Actualizar desde carpetas (si existen)
@@ -100,7 +101,7 @@ def get_class_name(index: int) -> str:
 D_MODEL = 128
 N_HEADS = 4
 N_LAYERS = 3            # 3 capas para mejor rendimiento
-DROPOUT = 0.4           # Mayor dropout contra overfitting
+DROPOUT = 0.5           # Balance regularización (era 0.6)
 
 MAX_SEQ_LEN = 90
 MIN_SEQ_LEN = 15
@@ -118,7 +119,7 @@ WEIGHT_DECAY = 1e-4     # L2 regularization
 GRADIENT_CLIP = 1.0
 
 # Regularización
-LABEL_SMOOTHING = 0.1   # Previene sobreconfianza
+LABEL_SMOOTHING = 0.15  # Balance (era 0.2)
 
 # Early stopping
 EPOCHS = 150
@@ -141,6 +142,38 @@ def get_mlflow_tracking_uri() -> str:
     """Retorna URI de MLflow compatible con Windows."""
     mlflow_db = MLRUNS_DIR / "mlflow.db"
     return f"sqlite:///{mlflow_db}"
+
+
+def get_latest_processed_dir() -> Path:
+    """
+    Retorna el directorio de datos procesados más reciente.
+    
+    Busca en este orden:
+    1. El directorio indicado en .latest_processed (creado por preprocessor --full)
+    2. El directorio processed por defecto
+    
+    Returns:
+        Path al directorio de datos procesados más reciente
+    """
+    latest_file = DATASET_DIR / ".latest_processed"
+    
+    if latest_file.exists():
+        latest_name = latest_file.read_text().strip()
+        latest_dir = DATASET_DIR / latest_name
+        if latest_dir.exists():
+            return latest_dir
+    
+    # Fallback: buscar el directorio versionado más reciente
+    versioned_dirs = sorted([
+        d for d in DATASET_DIR.iterdir()
+        if d.is_dir() and d.name.startswith("processed_v")
+    ], reverse=True)
+    
+    if versioned_dirs:
+        return versioned_dirs[0]
+    
+    # Fallback final: directorio por defecto
+    return PROCESSED_DATA_DIR
 
 # -----------------------------------------------------------
 # FUNCIONES AUXILIARES

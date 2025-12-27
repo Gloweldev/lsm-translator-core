@@ -23,7 +23,10 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.config.settings import PROCESSED_DATA_DIR, RAW_DATA_DIR, INPUT_DIM, MIN_SEQ_LEN, MAX_SEQ_LEN, CLASS_NAMES
+from src.config.settings import (
+    PROCESSED_DATA_DIR, RAW_DATA_DIR, INPUT_DIM, MIN_SEQ_LEN, MAX_SEQ_LEN, 
+    CLASS_NAMES, get_latest_processed_dir
+)
 
 # Configuración de validación
 EXPECTED_FEATURES = INPUT_DIM  # 266 (133 * 2)
@@ -281,14 +284,30 @@ def calculate_class_weights(class_counts: dict) -> dict:
 
 def run_inspection():
     """Ejecuta la inspección completa."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Inspector de Tensores Procesados")
+    parser.add_argument("-d", "--data", type=str,
+                       help="Path to processed data directory")
+    args = parser.parse_args()
+    
+    # Determinar directorio de datos
+    if args.data:
+        data_path = Path(args.data)
+        if not data_path.is_absolute():
+            data_path = PROCESSED_DATA_DIR.parent / args.data
+    else:
+        # Por defecto: usar la última versión procesada
+        data_path = get_latest_processed_dir()
+    
     print("=" * 70)
     print("🔍 Inspector de Tensores Procesados")
     print("=" * 70)
-    print(f"📂 Directorio: {PROCESSED_DATA_DIR}")
+    print(f"📂 Directorio: {data_path}")
     print(f"📏 Features esperados: {EXPECTED_FEATURES}")
     print("=" * 70)
     
-    if not PROCESSED_DATA_DIR.exists():
+    if not data_path.exists():
         print("❌ El directorio no existe. Ejecuta primero el preprocessor.")
         return
     
@@ -301,7 +320,7 @@ def run_inspection():
     valid_files = 0
     
     # Escanear
-    for class_dir in sorted(PROCESSED_DATA_DIR.iterdir()):
+    for class_dir in sorted(data_path.iterdir()):
         if not class_dir.is_dir():
             continue
         

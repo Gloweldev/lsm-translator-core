@@ -38,6 +38,7 @@ from src.config.settings import (
     # Rutas
     PROCESSED_DATA_DIR,
     MLRUNS_DIR,
+    get_latest_processed_dir,
     # Modelo
     INPUT_DIM,
     D_MODEL,
@@ -166,18 +167,74 @@ class LSMDataset(Dataset):
         return seq
     
     def _apply_feature_augmentation(self, seq):
-        """Augmentación de features (ruido, dropout)."""
-        # 1. Ruido gaussiano (50% prob)
-        if np.random.random() < 0.5:
-            noise = np.random.normal(0, 0.02, seq.shape)
+        """
+        Augmentación de features con enfoque en manos.
+        
+        Incluye:
+        - Zero de partes no relevantes (piernas/pies)
+        - Ruido gaussiano
+        - Dropout de frames
+        - Spatial jitter (movimiento sutil)
+        - Random masking de keypoints no-manos
+        """
+        # 0. SIEMPRE: Zero out piernas y pies (índices 13-22)
+        # Estos no son relevantes para señas y añaden ruido
+        LOWER_BODY_START = 13
+        LOWER_BODY_END = 23  # Hasta el 22 inclusive
+        for i in range(LOWER_BODY_START, LOWER_BODY_END):
+            seq[:, i*2] = 0      # X
+            seq[:, i*2 + 1] = 0  # Y
+        
+        # 1. Ruido gaussiano (70% prob) - más frecuente
+        if np.random.random() < 0.7:
+            noise_std = np.random.uniform(0.01, 0.05)  # Variación de intensidad
+            noise = np.random.normal(0, noise_std, seq.shape)
             mask = seq != 0
             seq = seq + noise * mask
         
-        # 2. Dropout de frames (20% prob)
-        if np.random.random() < 0.2 and len(seq) > 20:
-            drop_mask = np.random.random(len(seq)) > 0.1
+        # 2. Dropout de frames (30% prob)
+        if np.random.random() < 0.3 and len(seq) > 20:
+            drop_rate = np.random.uniform(0.05, 0.15)
+            drop_mask = np.random.random(len(seq)) > drop_rate
             if drop_mask.sum() > 15:
                 seq = seq[drop_mask]
+        
+        # 3. Spatial jitter (40% prob) - pequeño desplazamiento global
+        if np.random.random() < 0.4:
+            # Añadir offset pequeño a todas las coordenadas
+            jitter_x = np.random.uniform(-0.05, 0.05)
+            jitter_y = np.random.uniform(-0.05, 0.05)
+            for i in range(seq.shape[1] // 2):
+                if np.any(seq[:, i*2] != 0):
+                    seq[:, i*2] += jitter_x
+                    seq[:, i*2 + 1] += jitter_y
+        
+        # 4. Scale augmentation (30% prob) - escalar gestos
+        if np.random.random() < 0.3:
+            scale = np.random.uniform(0.9, 1.1)
+            seq = seq * scale
+        
+        # 5. Random dropout de keypoints no-mano (20% prob)
+        # Hacer 0 random keypoints del cuerpo/cara para forzar enfoque en manos
+        if np.random.random() < 0.2:
+            # Índices de cuerpo (0-22) y cara (23-90)
+            body_face_indices = list(range(0, 91))
+            # Excluir muñecas (9, 10) que son importantes
+            body_face_indices = [i for i in body_face_indices if i not in [9, 10]]
+            
+            # Dropout 10-30% de estos keypoints
+            n_drop = int(len(body_face_indices) * np.random.uniform(0.1, 0.3))
+            drop_indices = np.random.choice(body_face_indices, n_drop, replace=False)
+            
+            for i in drop_indices:
+                seq[:, i*2] = 0
+                seq[:, i*2 + 1] = 0
+        
+        # 6. Horizontal flip - DESHABILITADO
+        # Causa confusión entre A, B, C que son señas de mano similar
+        # if np.random.random() < 0.3:
+        #     for i in range(seq.shape[1] // 2):
+        #         seq[:, i*2] = -seq[:, i*2]
         
         return seq
 
@@ -315,8 +372,49 @@ def plot_training_curves(history, save_path):
     plt.close()
 
 
-def main():
+def main(data_dir: Path = None):
     """Punto de entrada principal."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="LSM-Core Training Pipeline")
+    parser.add_argument("-d", "--data", type=str, 
+                       help="Path to preprocessed data directory (default: dataset/processed)")
+    parser.add_argument("--list-versions", action="store_true",
+                       help="List available processed data versions")
+    args = parser.parse_args()
+    
+    # Si se pide listar versiones
+    if args.list_versions:
+        dataset_dir = PROCESSED_DATA_DIR.parent
+        versions = sorted([d for d in dataset_dir.iterdir() 
+                          if d.is_dir() and d.name.startswith("processed")])
+        print("📁 Versiones disponibles de datos preprocesados:")
+        for v in versions:
+            npy_count = len(list(v.rglob("*.npy")))
+            print(f"   {v.name}: {npy_count} archivos")
+        
+        # Mostrar última versión
+        latest_file = dataset_dir / ".latest_processed"
+        if latest_file.exists():
+            print(f"\n🏷️ Última versión: {latest_file.read_text().strip()}")
+        return
+    
+    # Determinar directorio de datos
+    if args.data:
+        data_path = Path(args.data)
+        if not data_path.is_absolute():
+            data_path = PROCESSED_DATA_DIR.parent / args.data
+    elif data_dir:
+        data_path = data_dir
+    else:
+        # Por defecto: usar la última versión procesada
+        data_path = get_latest_processed_dir()
+    
+    if not data_path.exists():
+        print(f"❌ Directorio no encontrado: {data_path}")
+        print("   Use --list-versions para ver versiones disponibles")
+        return
+    
     # Construir config dict para logging
     config = {
         'input_dim': INPUT_DIM,
@@ -335,11 +433,13 @@ def main():
         'patience': PATIENCE,
         'min_delta': MIN_DELTA,
         'test_size': TEST_SIZE,
+        'data_dir': str(data_path),
     }
     
     print("=" * 70)
     print("🚀 LSM-Core Training Pipeline")
     print("=" * 70)
+    print(f"📂 Datos: {data_path}")
     print(f"📊 Config desde settings.py:")
     print(f"   Modelo: d_model={D_MODEL}, heads={N_HEADS}, layers={N_LAYERS}")
     print(f"   Training: epochs={EPOCHS}, batch={BATCH_SIZE}, lr={LEARNING_RATE}")
@@ -352,8 +452,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥️ Device: {device}")
     
-    # Cargar datos
-    sequences, labels = load_dataset(PROCESSED_DATA_DIR)
+    # Cargar datos desde directorio seleccionado
+    sequences, labels = load_dataset(data_path)
     
     if len(sequences) == 0:
         print("❌ No hay datos para entrenar.")

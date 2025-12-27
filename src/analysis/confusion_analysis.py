@@ -30,19 +30,20 @@ from src.config.settings import (
     D_MODEL,
     N_HEADS,
     N_LAYERS,
-    CLASS_NAMES
+    CLASS_NAMES,
+    get_latest_processed_dir
 )
 from src.models.transformer import LSMTransformer
 
 
-def load_dataset():
+def load_dataset(data_dir: Path):
     """Carga todo el dataset procesado."""
     sequences = []
     labels = []
     filenames = []
     
     for class_idx, class_name in enumerate(CLASS_NAMES):
-        class_dir = PROCESSED_DATA_DIR / class_name
+        class_dir = data_dir / class_name
         if not class_dir.exists():
             print(f"⚠️ Directorio no encontrado: {class_dir}")
             continue
@@ -211,9 +212,30 @@ def plot_confusion_matrix(cm, save_path):
 
 
 def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Análisis de Confusión del Modelo")
+    parser.add_argument("-d", "--data", type=str,
+                       help="Path to processed data directory (should match training data)")
+    args = parser.parse_args()
+    
+    # Determinar directorio de datos
+    if args.data:
+        data_path = Path(args.data)
+        if not data_path.is_absolute():
+            data_path = PROCESSED_DATA_DIR.parent / args.data
+    else:
+        # Por defecto: usar la última versión procesada
+        data_path = get_latest_processed_dir()
+    
     print("=" * 60)
     print("🔍 Análisis de Confusión del Modelo")
     print("=" * 60)
+    print(f"📂 Datos: {data_path}")
+    
+    if not data_path.exists():
+        print(f"❌ Directorio no encontrado: {data_path}")
+        return
     
     # Cargar modelo
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -236,11 +258,19 @@ def main():
     ).to(device)
     
     model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"✅ Modelo cargado: epoch {checkpoint.get('epoch', '?')}")
+    
+    epoch = checkpoint.get('epoch', '?')
+    run_id = checkpoint.get('run_id', 'N/A')
+    val_acc = checkpoint.get('val_acc', 0)
+    
+    print(f"✅ Modelo cargado:")
+    print(f"   📁 Path: {model_path.name}")
+    print(f"   🔖 Run ID: {run_id}")
+    print(f"   📊 Epoch: {epoch}, Val Acc: {val_acc:.4f}")
     
     # Cargar dataset
-    print("\n📂 Cargando dataset...")
-    sequences, labels, filenames = load_dataset()
+    print(f"\n📂 Cargando dataset desde: {data_path}")
+    sequences, labels, filenames = load_dataset(data_path)
     print(f"   Total muestras: {len(sequences)}")
     
     # Evaluar

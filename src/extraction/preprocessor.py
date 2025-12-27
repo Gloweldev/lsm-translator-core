@@ -143,6 +143,117 @@ def apply_confidence_filter(keypoints: np.ndarray, scores: np.ndarray, threshold
     return filtered
 
 
+def is_hand_valid(keypoints: np.ndarray, scores: np.ndarray,
+                  hand_start: int, hand_end: int, wrist_idx: int,
+                  max_spread: float = 150,
+                  min_confidence: float = 0.8,
+                  high_confidence: float = 0.9,
+                  max_wrist_distance: float = 100) -> bool:
+    """
+    Valida si una mano es confiable para usar.
+    
+    Checks:
+    1. Mínimo 5 puntos válidos
+    2. Coherencia espacial (puntos agrupados)
+    3. Confianza promedio mínima
+    4. Proximidad a la muñeca
+    
+    Args:
+        keypoints: Nx2 array de coordenadas
+        scores: N array de scores de confianza
+        hand_start: Índice inicial de la mano
+        hand_end: Índice final de la mano (exclusive)
+        wrist_idx: Índice de la muñeca correspondiente (9=izq, 10=der)
+        max_spread: Distancia máxima permitida entre puntos
+        min_confidence: Confianza promedio mínima
+        high_confidence: Umbral para aceptar sin muñeca visible
+        max_wrist_distance: Distancia máxima del centro de mano a la muñeca
+        
+    Returns:
+        True si la mano es válida
+    """
+    hand_pts = keypoints[hand_start:hand_end]
+    hand_scores = scores[hand_start:hand_end]
+    
+    # Puntos válidos (no cero)
+    valid_mask = np.any(hand_pts != 0, axis=1)
+    valid_pts = hand_pts[valid_mask]
+    valid_scores = hand_scores[valid_mask]
+    
+    # Check 1: Mínimo de puntos
+    if len(valid_pts) < 5:
+        return False
+    
+    # Check 2: Coherencia espacial
+    spread_x = valid_pts[:, 0].max() - valid_pts[:, 0].min()
+    spread_y = valid_pts[:, 1].max() - valid_pts[:, 1].min()
+    
+    if spread_x > max_spread or spread_y > max_spread:
+        return False
+    
+    # Check 3: Confianza promedio
+    avg_conf = valid_scores.mean()
+    if avg_conf < min_confidence:
+        return False
+    
+    # Check 4: Proximidad a la muñeca
+    wrist = keypoints[wrist_idx]
+    wrist_conf = scores[wrist_idx]
+    
+    if wrist_conf >= 0.5 and wrist[0] > 0 and wrist[1] > 0:
+        # Muñeca visible: mano debe estar cerca
+        hand_center = valid_pts.mean(axis=0)
+        distance = np.sqrt(((hand_center - wrist) ** 2).sum())
+        
+        if distance > max_wrist_distance:
+            return False
+    else:
+        # Muñeca no visible: solo aceptar si muy alta confianza
+        if avg_conf < high_confidence:
+            return False
+    
+    return True
+
+
+def filter_incoherent_hands(keypoints: np.ndarray, scores: np.ndarray = None, 
+                            max_spread: float = 150) -> np.ndarray:
+    """
+    Filtra manos incoherentes (alucinadas) poniéndolas a cero.
+    
+    Args:
+        keypoints: Nx2 array de coordenadas
+        scores: N array de scores (opcional, si no se provee usa check simple)
+        max_spread: Distancia máxima permitida para una mano coherente
+        
+    Returns:
+        Nx2 array con manos incoherentes en (0, 0)
+    """
+    filtered = keypoints.copy()
+    
+    if scores is not None:
+        # Validación completa con scores
+        # Mano izquierda: 91-111, muñeca izquierda: 9
+        if not is_hand_valid(keypoints, scores, 91, 112, wrist_idx=9, max_spread=max_spread):
+            filtered[91:112] = [0.0, 0.0]
+        
+        # Mano derecha: 112-132, muñeca derecha: 10
+        if not is_hand_valid(keypoints, scores, 112, 133, wrist_idx=10, max_spread=max_spread):
+            filtered[112:133] = [0.0, 0.0]
+    else:
+        # Validación simple sin scores (compatibilidad)
+        hand_pts = keypoints[91:112]
+        valid_pts = hand_pts[np.any(hand_pts != 0, axis=1)]
+        if len(valid_pts) < 5 or (valid_pts[:, 0].max() - valid_pts[:, 0].min()) > max_spread:
+            filtered[91:112] = [0.0, 0.0]
+        
+        hand_pts = keypoints[112:133]
+        valid_pts = hand_pts[np.any(hand_pts != 0, axis=1)]
+        if len(valid_pts) < 5 or (valid_pts[:, 0].max() - valid_pts[:, 0].min()) > max_spread:
+            filtered[112:133] = [0.0, 0.0]
+    
+    return filtered
+
+
 def normalize_to_center(keypoints: np.ndarray, left_hip_idx: int = LEFT_HIP_IDX, right_hip_idx: int = RIGHT_HIP_IDX) -> np.ndarray:
     """
     Normaliza keypoints restando el centro de las caderas.
@@ -291,6 +402,10 @@ class VideoPreprocessor:
                 # Paso A: Filtro de confianza
                 keypoints = apply_confidence_filter(keypoints, scores, CONFIDENCE_THRESHOLD)
                 
+                # Paso A.5: Filtrar manos incoherentes (alucinaciones)
+                # Pasamos scores para validación completa con muñeca
+                keypoints = filter_incoherent_hands(keypoints, scores=scores)
+                
                 # Paso B: Suavizado
                 if apply_smoothing:
                     keypoints = self.smoother.smooth(timestamp, keypoints)
@@ -344,6 +459,24 @@ class VideoPreprocessor:
         ensure_dirs()
         load_classes()
         
+        # Crear directorio versionado con timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if full_reprocess:
+            # Nuevo directorio versionado
+            versioned_dir = PROCESSED_DATA_DIR.parent / f"processed_v{timestamp}"
+            versioned_dir.mkdir(parents=True, exist_ok=True)
+            output_base = versioned_dir
+            logger.info(f"📁 Creando versión: {versioned_dir.name}")
+            
+            # Guardar referencia a última versión
+            latest_file = PROCESSED_DATA_DIR.parent / ".latest_processed"
+            latest_file.write_text(versioned_dir.name)
+        else:
+            # Modo incremental: usar directorio actual
+            output_base = PROCESSED_DATA_DIR
+        
         # Recolectar todos los videos
         videos = []
         skipped_existing = 0
@@ -354,7 +487,7 @@ class VideoPreprocessor:
             
             class_name = class_dir.name
             for video_file in class_dir.glob("*.mp4"):
-                output_path = PROCESSED_DATA_DIR / class_name / (video_file.stem + ".npy")
+                output_path = output_base / class_name / (video_file.stem + ".npy")
                 
                 # En modo incremental, saltar si ya existe
                 if not full_reprocess and output_path.exists():
